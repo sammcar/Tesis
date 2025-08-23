@@ -1,0 +1,7 @@
+{
+    "idf.espIdfPath": "/home/sam/esp-idf",
+    "idf.toolsPath": "/home/sam/.espressif",
+    "idf.pythonInstallPath": "/home/sam/.espressif/python_env/idf5.5_py3.10_env/bin/python",
+    "idf.port": "/dev/ttyUSB0",
+    "idf.flashType": "UART"
+}

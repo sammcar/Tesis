@@ -1,0 +1,102 @@
+INICIO
+
+  // VARIABLES DE CONTROL GENERAL
+  Estado_Sistema ← APAGADO
+  Estado_Modo ← SELECCIONAR_MODO
+  Modo_Seleccionado ← NULO
+  Sistema_Calibrado ← FALSO
+  Angulo_Objetivo ← 0.0
+  Fallo ← FALSO
+
+  // INICIALIZACIÓN
+  Inicializar_Sensores()
+  Inicializar_Motor()
+  Inicializar_Interfaces_Seriales()
+  Inicializar_PID()
+  Mostrar_Menu_Modos()
+
+  MIENTRAS verdadero HACER
+
+    SI Estado_Sistema = APAGADO ENTONCES
+      Esperar_Orden_Encendido()
+      Estado_Sistema ← ENCENDIDO
+    FIN_SI
+
+    SI Estado_Sistema = ENCENDIDO ENTONCES
+
+      SELECCIONAR Modo_Seleccionado
+
+        CASO F1_PRODUCCION_NORMAL:
+          SI NO Sistema_Calibrado ENTONCES
+            Ejecutar_Calibracion_Potenciometro()
+            Sistema_Calibrado ← VERDADERO
+          FIN_SI
+          Leer_Entrada_Usuario()
+          Ejecutar_Control_PID()
+          Monitorear_Sensores()
+          Verificar_Alarmas()
+        FIN_CASO
+
+        CASO F2_PREPARACION:
+          Mostrar_Mensaje("Preparando sistema...")
+          Ejecutar_Procedimiento_Preparacion()
+          Verificar_Temperaturas()
+          Verificar_Conexiones()
+        FIN_CASO
+
+        CASO F3_CIERRE:
+          Mostrar_Mensaje("Ciclo de cierre...")
+          Ejecutar_Vaciado()
+          Ejecutar_Limpieza()
+          Confirmar_Finalizacion_Correcta()
+        FIN_CASO
+
+        CASO F4_VERIFICACION_SIN_ORDEN:
+          Mostrar_Mensaje("Modo prueba libre. Operador controla.")
+          Permitir_Movimientos_Manuales()
+          Leer_Controles_Operador()
+        FIN_CASO
+
+        CASO F5_VERIFICACION_EN_ORDEN:
+          Mostrar_Mensaje("Verificación paso a paso.")
+          Para cada paso en Ciclo_Produccion
+            Esperar_Confirmacion_Operador()
+            Ejecutar_Paso(paso)
+            Registrar_Resultados()
+          FinPara
+        FIN_CASO
+
+        CASO F6_PRUEBA:
+          Mostrar_Mensaje("Pruebas automáticas.")
+          Ejecutar_Secuencia_Prueba()
+          Medir_Eficiencia()
+          Guardar_Resultados()
+        FIN_CASO
+
+        CASO OTRO:
+          Mostrar_Error("Modo no válido")
+        FIN_CASO
+
+      FIN_SELECCIONAR
+
+      // DETECCIÓN DE FALLOS
+      SI Detectar_Error_Sensor() O Detectar_Desfase_Motor() O Timeout_Proceso()
+        Fallo ← VERDADERO
+        Estado_Sistema ← ERROR
+        Ejecutar_Modo_Seguro()
+        Notificar_Error()
+      FIN_SI
+
+    FIN_SI
+
+    SI Estado_Sistema = ERROR ENTONCES
+      Mostrar_Mensaje("Fallo detectado. Esperando reinicio manual...")
+      Esperar_Reinicio_Operador()
+      Estado_Sistema ← ENCENDIDO
+      Fallo ← FALSO
+    FIN_SI
+
+  FIN_MIENTRAS
+
+FIN
+
