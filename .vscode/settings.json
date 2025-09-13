@@ -1,0 +1,11 @@
+
+{
+  "cmake.environment": {
+    "IDF_PATH": "/home/sam/.platformio/packages/framework-espidf"
+  },
+  "cmake.configureOnOpen": true,
+  "platformio-ide.projectDirs": [
+    "Tesis"
+  ]
+}
+
