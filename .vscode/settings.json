@@ -6,6 +6,7 @@
   "cmake.configureOnOpen": true,
   "platformio-ide.projectDirs": [
     "Tesis"
-  ]
+  ],
+  "idf.pythonInstallPath": "/home/sam/.platformio/penv/bin/python"
 }
 
