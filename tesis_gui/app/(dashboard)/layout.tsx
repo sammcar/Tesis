@@ -1,27 +1,22 @@
-import type { ReactNode } from "react";
-import "@/app/globals.css";
-import Link from "next/link";
+// app/(dashboard)/layout.tsx
+import { redirect } from "next/navigation";
+import SplineBackground from "@/components/SplineBackground";
+import { getCurrentUser } from "@/lib/server/getCurrentUser";
+import { Toaster } from "@/components/ui/toaster"; // 👈 este
 
-function Navbar() {
-  return (
-    <header className="sticky top-0 z-30 w-full border-b border-gray-200 bg-background/80 backdrop-blur">
-      <div className="mx-auto flex h-14 max-w-7xl items-center justify-between px-4">
-        <Link href="/menu" className="font-semibold">Tesis • Panel</Link>
-        <nav className="flex items-center gap-4 text-sm">
-          <Link href="/parametros">Parámetros</Link>
-          <Link href="/monitoreo">Monitoreo</Link>
-          <Link href="/verificar">Verificar</Link>
-        </nav>
-      </div>
-    </header>
-  );
-}
+import "../globals.css";
 
-export default function DashboardLayout({ children }: { children: ReactNode }) {
+export default async function DashboardLayout({ children }: { children: React.ReactNode }) {
+  const user = await getCurrentUser();
+  if (!user) redirect("/login");
+
   return (
-    <div className="min-h-screen bg-background text-foreground">
-      <Navbar />
-      <main className="mx-auto max-w-7xl px-4 py-6">{children}</main>
-    </div>
+    <>
+      <main className="relative min-h-dvh">
+        <SplineBackground />
+        <div className="relative z-10">{children}</div>
+      </main>
+      <Toaster /> {/* 👈 montado una sola vez */}
+    </>
   );
 }

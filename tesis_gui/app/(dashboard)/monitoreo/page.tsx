@@ -1,36 +1,833 @@
-import Card from "@/components/Card";
-import EstopButton from "@/components/EstopButton";
-import CameraPreview from "@/components/CameraPreview";
-import MetricsMiniChart from "@/components/MetricsMiniChart";
-// más adelante: import dynamic Hero3D con Spline o R3F
+// app/(dashboard)/monitoreo/page.tsx
+"use client";
 
+import { useEffect, useMemo, useRef, useState } from "react";
+import Link from "next/link";
+import { useRouter } from "next/navigation";
+import Spline from "@splinetool/react-spline";
+import {
+  ArrowLeft, Power, RefreshCcw, Camera, TerminalSquare,
+  Activity, Ruler, Circle, X,
+} from "lucide-react";
+import {
+  AlertDialog,
+  AlertDialogAction,
+  AlertDialogContent,
+  AlertDialogDescription,
+  AlertDialogFooter,
+  AlertDialogHeader,
+  AlertDialogTitle,
+} from "@/components/ui/alert-dialog";
+
+/* ========== helpers ========== */
+const cn = (...xs: (string | false | undefined)[]) => xs.filter(Boolean).join(" ");
+const clamp = (v: number, lo: number, hi: number) => Math.min(hi, Math.max(lo, v));
+
+/* ========== página ========== */
 export default function MonitoreoPage() {
-  return (
-    <div className="space-y-6">
-      {/* TODO: Hero3D aquí */}
-      <section className="grid grid-cols-1 gap-6 sm:grid-cols-2 lg:grid-cols-4">
-        <Card title="Humedad IN"><div className="text-5xl font-semibold">30%</div></Card>
-        <Card title="Presión"><div className="text-5xl font-semibold">55 hPa</div></Card>
-        <Card title="Caudal"><div className="text-5xl font-semibold">0.5 ml/min</div></Card>
-        <Card title="Temperatura OUT"><div className="text-5xl font-semibold">22°C</div></Card>
-      </section>
+  const router = useRouter();
 
-      <section className="grid grid-cols-1 gap-6 lg:grid-cols-3">
-        <Card title="Cámara (ESP32-CAM)">
-          <CameraPreview />
-          <p className="mt-2 text-xs text-gray-500">Snapshot cada ~3s.</p>
-        </Card>
-        <Card title="Métricas en vivo">
-          <MetricsMiniChart />
-          <p className="mt-2 text-xs text-gray-500">Luego: MQTT (WSS) → Chart.js/uPlot.</p>
-        </Card>
-        <Card title="Logs / Notificaciones">
-          <ul className="list-disc space-y-1 pl-5 text-sm">
-            <li>System ready</li><li>Variac set to 1200 rpm</li><li>Jeringa 0.5 ml/min</li>
-          </ul>
-          <div className="mt-4"><EstopButton /></div>
-        </Card>
-      </section>
+  // ----- estados control -----
+  const [isOn, setIsOn] = useState(false);
+  const [estopActive, setEstopActive] = useState(false);
+  const [faultLatched, setFaultLatched] = useState(false);
+
+  // ----- logs / consola -----
+  const [logs, setLogs] = useState<string[]>(["Monitoreo iniciado.", "MQTT: desconectado (mock)"]);
+  const [inputLine, setInputLine] = useState("");
+  const inputRef = useRef<HTMLInputElement>(null);
+
+  // ----- cámara (mock) -----
+  const [cameraTick, setCameraTick] = useState(0);
+  const cameraRefreshMs = 3000;
+  const cameraUrl = useMemo(
+    () => `https://picsum.photos/seed/monitoreo-${cameraTick}/1024/576`,
+    [cameraTick]
+  );
+
+  // ----- series (mock) -----
+  const [angleSeries, setAngleSeries] = useState<number[]>([]);
+  const [distanceSeries, setDistanceSeries] = useState<number[]>([]);
+
+  // ----- luces -----
+  const [rs485Ok, setRs485Ok] = useState(true);
+  const [rs232Ok, setRs232Ok] = useState(true);
+
+  // ----- timer -----
+  const [elapsedMs, setElapsedMs] = useState(0);
+
+  // ----- modales -----
+  const [faultOpen, setFaultOpen] = useState(false);
+  const [faultTitle, setFaultTitle] = useState("");
+  const [faultDesc, setFaultDesc] = useState("");
+  const [shakeTick, setShakeTick] = useState(0);
+
+  const [finishOpen, setFinishOpen] = useState(false);
+  const [finishDesc, setFinishDesc] = useState("");
+
+  // ----- zoom modal (cámara / charts) -----
+  const [zoomOpen, setZoomOpen] = useState(false);
+  const [zoomKind, setZoomKind] = useState<"camera" | "angle" | "distance" | null>(null);
+
+  // ----- refs para bucles estables (evitar “max depth”) -----
+  const runningRef = useRef(true);                 // gobierna timer
+  const estopRef = useRef(false);
+  const faultRef = useRef(false);
+  const finishRef = useRef(false);
+  // arriba, junto a otros useRef/useState:
+  const splineCanvasRef = useRef<HTMLCanvasElement | null>(null);
+
+  // mantener refs sincronizadas
+  useEffect(() => { estopRef.current = estopActive; }, [estopActive]);
+  useEffect(() => { faultRef.current = faultLatched; }, [faultLatched]);
+  useEffect(() => { finishRef.current = finishOpen; }, [finishOpen]);
+
+  // ======== Spline (sin blur, sin reinicios) ========
+  // usamos onLoad para disparar la tecla S una vez que la escena está lista
+  // reemplaza handleSplineLoad por esto:
+  const handleSplineLoad = (_splineApp: any) => {
+    // Sólo guardamos el canvas y lo hacemos focusable
+    const canvas: HTMLCanvasElement | null = document.querySelector("canvas");
+    if (canvas) {
+      canvas.tabIndex = 0;
+      splineCanvasRef.current = canvas;
+      setLogs(p => ["[Spline] escena lista", ...p].slice(0, 300));
+    }
+  };
+
+  // Llama a esto cuando llegue el mensaje "fin de prueba" por MQTT
+  function handleMqttTestFinished() {
+    const seconds = Math.max(0, Math.floor(elapsedMs / 1000));
+    const mm = Math.floor(seconds / 60).toString().padStart(2, "0");
+    const ss = (seconds % 60).toString().padStart(2, "0");
+    setFinishDesc(`La prueba ha terminado en ${mm}:${ss}.`);
+    setFinishOpen(true);
+    setLogs(p => ["[FIN DE PRUEBA] recibido por MQTT", ...p].slice(0, 300));
+  }
+
+  // ======== Timer con un solo rAF (no dependencias) ========
+  useEffect(() => {
+    let raf = 0;
+    let last: number | null = null;
+
+    const loop = (t: number) => {
+      if (finishRef.current || faultRef.current || estopRef.current) {
+        last = t; // “pausa”: reanudar sin saltos
+      } else {
+        if (last == null) last = t;
+        const dt = t - last;
+        last = t;
+        setElapsedMs(ms => ms + dt);
+      }
+      raf = requestAnimationFrame(loop);
+    };
+
+    raf = requestAnimationFrame(loop);
+    return () => cancelAnimationFrame(raf);
+  }, []);
+
+  // ======== Series mock: un solo setInterval de por vida ========
+  useEffect(() => {
+    const id = setInterval(() => {
+      if (estopRef.current || faultRef.current || finishRef.current) return;
+      const angle = 1800 + 1200 * Math.sin(Date.now() / 800);
+      const dist  = 15 + 10 * Math.cos(Date.now() / 900);
+      setAngleSeries(s => {
+        const next = [...s, angle];
+        if (next.length > 600) next.shift();
+        return next;
+      });
+      setDistanceSeries(s => {
+        const next = [...s, dist];
+        if (next.length > 600) next.shift();
+        return next;
+      });
+    }, 150);
+    return () => clearInterval(id);
+  }, []);
+
+  // ======== Cámara (mock) ========
+  useEffect(() => {
+    const id = setInterval(() => {
+      if (estopRef.current || faultRef.current || finishRef.current) return;
+      setCameraTick(t => t + 1);
+    }, cameraRefreshMs);
+    return () => clearInterval(id);
+  }, []);
+
+  // ======== Logs periódicos (mock) ========
+  useEffect(() => {
+    const id = setInterval(() => {
+      const now = new Date().toLocaleTimeString();
+      const line = (!estopRef.current && !faultRef.current && !finishRef.current)
+        ? `[${now}] Telemetría: OK · angle=${(angleSeries.at(-1) ?? 0).toFixed(1)}° · dist=${(distanceSeries.at(-1) ?? 0).toFixed(1)}cm`
+        : `[${now}] Sistema en pausa.`;
+      setLogs(p => [line, ...p].slice(0, 300));
+    }, 3000);
+    return () => clearInterval(id);
+  }, [angleSeries, distanceSeries]);
+
+  // // ======== Fin de prueba mock (cada ~45s) ========
+  // useEffect(() => {
+  //   const id = setInterval(() => {
+  //     if (!finishRef.current && !faultRef.current) finish();
+  //   }, 45000);
+  //   return () => clearInterval(id);
+  // }, []);
+
+  // ======== Heartbeat (mock) ========
+  useEffect(() => {
+    const id = setInterval(() => {
+      setRs485Ok(true);
+      setRs232Ok(true);
+    }, 5000);
+    return () => clearInterval(id);
+  }, []);
+
+  // acciones
+  const panel = "rounded-2xl border border-white/15 bg-black/30 p-4 shadow-[0_4px_20px_rgba(0,0,0,0.18)]"; // sin blur
+  const title = "text-sm font-medium text-white/90";
+  const globalDisabled = estopActive || faultLatched || finishOpen;
+
+  const sendCommand = (cmd: string) => {
+    if (!cmd.trim()) return;
+    const now = new Date().toLocaleTimeString();
+    setLogs(p => [`[${now}] → ${cmd}`, ...p].slice(0, 300));
+    // TODO: MQTT publish
+  };
+
+  // helper reutilizable
+function fireSplineKeyPress(canvas: HTMLCanvasElement | null, key = "s") {
+    if (!canvas) return;
+    const opts = { key, code: "KeyS", bubbles: true };
+
+    // asegúrate que el canvas tenga el foco
+    canvas.focus();
+
+    // keydown -> pequeño delay -> keyup
+    canvas.dispatchEvent(new KeyboardEvent("keydown", opts));
+
+    // 60–100 ms suele ser suficiente para que el handler de Spline registre la pulsación
+    setTimeout(() => {
+      canvas.dispatchEvent(new KeyboardEvent("keyup", opts));
+    }, 80);
+}
+
+  // en tu componente
+  const togglePower = () => {
+    if (globalDisabled) return;
+
+    setIsOn(prev => {
+      const next = !prev;
+      sendCommand(next ? "POWER ON" : "POWER OFF");
+
+      // Dispara SIEMPRE la tecla "s" (keydown+keyup) al encender y también al apagar
+      fireSplineKeyPress(splineCanvasRef.current, "s");
+
+      setLogs(p => [
+        `[Spline] key 's' disparada por ${next ? "POWER ON" : "POWER OFF"}`,
+        ...p,
+      ].slice(0, 300));
+
+      return next;
+    });
+  };
+
+
+  const toggleEstop = () => {
+    const next = !estopActive;
+    setEstopActive(next);
+    if (next) {
+      setIsOn(false);
+      runningRef.current = false;
+      setLogs(p => ["E-STOP ACTIVADO", ...p].slice(0, 300));
+    } else {
+      runningRef.current = true;
+      setLogs(p => ["E-STOP LIBERADO", ...p].slice(0, 300));
+    }
+  };
+
+  const handleReset = () => {
+    if (globalDisabled) return;
+    setLogs(p => ["Reset ejecutado.", ...p].slice(0, 300));
+    setElapsedMs(0);
+    // TODO: MQTT publish RESET
+  };
+
+  const handleFaultReset = () => {
+    if (!faultLatched) return;
+    setFaultLatched(false);
+    setFaultOpen(false);
+    setLogs(p => ["Fallas reiniciadas (latch liberado).", ...p].slice(0, 300));
+    // TODO: MQTT publish RESET_FAULTS
+  };
+
+  const showFault = (title: string, desc: string) => {
+    setFaultLatched(true);
+    setFaultTitle(title);
+    setFaultDesc(desc);
+    setFaultOpen(true);
+    setShakeTick(t => t + 1);
+    setLogs(p => [`[FAULT] ${title}: ${desc}`, ...p].slice(0, 300));
+  };
+
+  const finish = () => {
+    const seconds = Math.max(0, Math.floor(elapsedMs / 1000));
+    const mm = Math.floor(seconds / 60).toString().padStart(2, "0");
+    const ss = (seconds % 60).toString().padStart(2, "0");
+    setFinishDesc(`La prueba ha terminado en ${mm}:${ss}.`);
+    setFinishOpen(true);
+    setLogs(p => ["[FIN DE PRUEBA] OK", ...p].slice(0, 300));
+  };
+
+  const fmtTime = (ms: number) => {
+    const total = Math.max(0, Math.floor(ms / 1000));
+    const hh = Math.floor(total / 3600).toString().padStart(2, "0");
+    const mm = Math.floor((total % 3600) / 60).toString().padStart(2, "0");
+    const ss = (total % 60).toString().padStart(2, "0");
+    return `${hh}:${mm}:${ss}`;
+  };
+
+  // zoom handlers
+  const openZoom = (kind: "camera" | "angle" | "distance") => {
+    setZoomKind(kind);
+    setZoomOpen(true);
+  };
+
+  return (
+    <main className="relative min-h-dvh">
+      {/* ===== Escena Spline: SIN blur, centro libre ===== */}
+      <div className="fixed inset-0 -z-10">
+        <div className="absolute inset-0">
+          <Spline
+            scene="https://prod.spline.design/uD-NZs1pTeMUa8bY/scene.splinecode"
+            onLoad={handleSplineLoad}
+          />
+
+        </div>
+        {/* overlay muy leve (sin blur) */}
+        <div className="absolute inset-0 pointer-events-none bg-gradient-to-b from-indigo-900/10 via-indigo-900/10 to-indigo-900/20" />
+      </div>
+
+      {/* ===== Rails laterales angostos ===== */}
+      <div
+        className={cn(
+          "pointer-events-none fixed inset-0 z-10 grid gap-3 p-3",
+          "md:grid-cols-[minmax(240px,300px)_1fr_minmax(240px,300px)]"
+        )}
+      >
+        {/* Columna izquierda */}
+        <aside className="pointer-events-auto flex flex-col gap-3">
+          <div className={panel}>
+            <div className="flex items-center justify-between">
+              <h1 className="text-lg font-semibold text-white">Monitoreo</h1>
+              <Link
+                href="/menu"
+                className="inline-flex items-center gap-2 rounded-xl border border-white/15 bg-black/30 px-3 py-2 text-xs text-white/90 hover:bg-black/40 focus:outline-none focus:ring-2 focus:ring-white/30"
+              >
+                <ArrowLeft className="h-4 w-4" />
+                Volver
+              </Link>
+            </div>
+            <div className="mt-3 flex items-center justify-between">
+              <div>
+                <p className={title}>Tiempo de prueba</p>
+                <div className="mt-1 text-2xl font-semibold text-white">
+                  {fmtTime(elapsedMs)}
+                </div>
+              </div>
+              <div className="flex items-center gap-2">
+                <CommLight label="RS485" ok={rs485Ok && !faultLatched} />
+                <CommLight label="RS232" ok={rs232Ok && !faultLatched} />
+              </div>
+            </div>
+          </div>
+
+          {/* controles */}
+          <div className={panel}>
+            <p className={title}>Controles globales</p>
+            <div className="mt-3 grid grid-cols-1 gap-2">
+              <button
+                type="button"
+                onClick={togglePower}
+                disabled={estopActive || faultLatched || finishOpen}
+                className={cn(
+                  "rounded-xl px-4 py-3 text-sm font-semibold transition",
+                  estopActive || faultLatched || finishOpen
+                    ? "cursor-not-allowed opacity-50"
+                    : isOn
+                    ? "bg-emerald-600 text-white hover:bg-emerald-500"
+                    : "border border-white/15 bg-black/30 text-white hover:bg-black/40"
+                )}
+              >
+                <span className="inline-flex items-center gap-2">
+                  <Power className="h-4 w-4" />
+                  {isOn ? "Apagar" : "Encender"}
+                </span>
+              </button>
+
+              <button
+                type="button"
+                onClick={toggleEstop}
+                className={cn(
+                  "rounded-xl px-4 py-3 text-sm font-semibold transition",
+                  estopActive
+                    ? "bg-emerald-600 text-white hover:bg-emerald-500"
+                    : "bg-rose-600 text-white hover:bg-rose-500"
+                )}
+                title={estopActive ? "Liberar paro" : "Activar paro de emergencia"}
+              >
+                {estopActive ? "OK" : "STOP"}
+              </button>
+
+              <button
+                type="button"
+                onClick={handleReset}
+                disabled={estopActive || faultLatched || finishOpen}
+                className={cn(
+                  "rounded-xl px-4 py-3 text-sm font-semibold transition",
+                  estopActive || faultLatched || finishOpen
+                    ? "cursor-not-allowed opacity-50"
+                    : "border border-white/15 bg-black/30 text-white hover:bg-black/40"
+                )}
+                title="Reset suave (reinicia timer y limpia logs)"
+              >
+                <span className="inline-flex items-center gap-2">
+                  <RefreshCcw className="h-4 w-4" />
+                  Reset
+                </span>
+              </button>
+
+              <button
+                type="button"
+                onClick={handleFaultReset}
+                disabled={!faultLatched}
+                className={cn(
+                  "rounded-xl px-4 py-3 text-sm font-semibold transition",
+                  !faultLatched
+                    ? "cursor-not-allowed opacity-50"
+                    : "border border-rose-400/40 bg-rose-700/20 text-rose-100 hover:bg-rose-700/30"
+                )}
+                title="Libera el latch de fallas (habilita botones)"
+              >
+                Reset de fallas
+              </button>
+            </div>
+          </div>
+
+          {/* consola */}
+          <div className={panel}>
+            <div className="mb-3 flex items-center gap-2">
+              <TerminalSquare className="h-5 w-5 text-white/80" />
+              <p className={title}>Consola (MQTT mock)</p>
+            </div>
+
+            <div className="mb-3 flex gap-2">
+              <input
+                ref={inputRef}
+                className="min-w-0 flex-1 rounded-xl border border-white/15 bg-black/30 px-3 py-2 text-white placeholder:text-white/50 focus:outline-none focus:ring-2 focus:ring-white/30"
+                placeholder="Escribe un comando (mock) y presiona Enviar"
+                value={inputLine}
+                onChange={(e) => setInputLine(e.target.value)}
+                onKeyDown={(e) => e.key === "Enter" && inputLine.trim() && setLogs(p => [`→ ${inputLine}`, ...p].slice(0, 300))}
+                disabled={estopActive || faultLatched || finishOpen}
+              />
+              <button
+                onClick={() => inputLine.trim() && setLogs(p => [`→ ${inputLine}`, ...p].slice(0, 300))}
+                disabled={estopActive || faultLatched || finishOpen || !inputLine.trim()}
+                className={cn(
+                  "rounded-xl px-4 py-2 text-sm font-medium transition",
+                  estopActive || faultLatched || finishOpen || !inputLine.trim()
+                    ? "text-white/50 border border-white/15 bg-black/30"
+                    : "text-white border border-white/15 bg-black/30 hover:bg-black/40"
+                )}
+              >
+                Enviar
+              </button>
+            </div>
+
+            <div className="h-56 overflow-auto rounded-xl border border-white/10 bg-zinc-900/70 p-3">
+              <ul className="space-y-1 font-mono text-xs text-zinc-100/90">
+                {logs.map((line, i) => <li key={i}>{line}</li>)}
+              </ul>
+            </div>
+          </div>
+        </aside>
+
+        {/* Centro vacío */}
+        <div className="hidden md:block" />
+
+        {/* Columna derecha */}
+        <aside className="pointer-events-auto flex flex-col gap-3">
+          {/* cámara */}
+          <div className={panel}>
+            <div className="mb-3 flex items-center justify-between">
+              <div className="flex items-center gap-2">
+                <Camera className="h-5 w-5 text-white/80" />
+                <p className={title}>Cámara (ESP32-CAM · mock)</p>
+              </div>
+              <button
+                type="button"
+                onClick={() => setCameraTick(t => t + 1)}
+                className="inline-flex items-center gap-2 rounded-xl border border-white/15 bg-black/30 px-3 py-2 text-xs text-white/90 hover:bg-black/40"
+                disabled={estopActive || faultLatched || finishOpen}
+                title="Refrescar snapshot"
+              >
+                <RefreshCcw className="h-4 w-4" />
+                Refrescar
+              </button>
+            </div>
+
+            <button
+              type="button"
+              onClick={() => openZoom("camera")}
+              className="block w-full overflow-hidden rounded-xl border border-white/10 bg-black/60 focus:outline-none"
+              title="Ampliar"
+              disabled={false}
+            >
+              <img src={cameraUrl} alt="Snapshot" className="h-auto w-full object-cover" />
+            </button>
+            <p className="mt-2 text-xs text-white/70">Click para ampliar · snapshot cada ~{cameraRefreshMs / 1000}s.</p>
+          </div>
+
+          {/* gráficas */}
+          <ChartCard
+            title="Ángulo (potenciómetro)"
+            onZoom={() => openZoom("angle")}
+            series={angleSeries}
+            unit="°"
+            yMin={0}
+            yMax={3600}
+            stroke="#0b4f9c"
+          />
+          <ChartCard
+            title="Distancia (sensor)"
+            onZoom={() => openZoom("distance")}
+            series={distanceSeries}
+            unit="cm"
+            yMin={0}
+            yMax={30}
+            stroke="#0b7d3b"
+          />
+
+          {/* botón mock falla */}
+          <div className="text-right">
+            <button
+              type="button"
+              onClick={() => showFault("Falla E42", "Sobrevoltaje en fuente HV")}
+              className="rounded-xl border border-white/15 bg-black/30 px-3 py-2 text-xs text-white/80 hover:bg-black/40"
+            >
+              Simular Falla (mock)
+            </button>
+          </div>
+        </aside>
+      </div>
+
+      {/* ===== Modal Falla ===== */}
+      <AlertDialog open={faultOpen} onOpenChange={setFaultOpen}>
+        <AlertDialogContent
+          className={cn(
+            "max-w-md rounded-2xl",
+            "border border-rose-400/40 bg-rose-600/20",
+            "text-white shadow-[0_8px_30px_rgba(255,0,0,0.35)]",
+            "animate-in fade-in duration-300"
+          )}
+        >
+          <div key={shakeTick} className="will-change-transform animate-[dialog-shake-x_0.45s]">
+            <AlertDialogHeader>
+              <AlertDialogTitle className="text-rose-300 font-semibold tracking-wide">
+                {faultTitle || "Falla detectada"}
+              </AlertDialogTitle>
+              <AlertDialogDescription className="whitespace-pre-line text-rose-100/90">
+                {faultDesc || "Revisar el sistema y reintentar."}
+              </AlertDialogDescription>
+            </AlertDialogHeader>
+            <AlertDialogFooter>
+              <AlertDialogAction
+                onClick={() => setFaultOpen(false)}
+                className="rounded-xl border border-rose-400/40 bg-rose-700/20 px-4 py-2 text-rose-100 hover:bg-rose-700/30 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-rose-300/60"
+              >
+                OK
+              </AlertDialogAction>
+            </AlertDialogFooter>
+          </div>
+        </AlertDialogContent>
+      </AlertDialog>
+
+      {/* ===== Modal Fin (verde) ===== */}
+      <AlertDialog open={finishOpen} onOpenChange={setFinishOpen}>
+        <AlertDialogContent
+          className={cn(
+            "max-w-md rounded-2xl",
+            "border border-emerald-400/40 bg-emerald-700/20",
+            "text-white shadow-[0_8px_30px_rgba(0,128,0,0.35)]",
+            "animate-in fade-in duration-300"
+          )}
+        >
+          <AlertDialogHeader>
+            <AlertDialogTitle className="text-emerald-300 font-semibold tracking-wide">
+              Prueba finalizada
+            </AlertDialogTitle>
+            <AlertDialogDescription className="whitespace-pre-line text-emerald-100/90">
+              {finishDesc || "La prueba ha terminado."}
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          <AlertDialogFooter>
+            <AlertDialogAction
+              onClick={() => router.push("/menu")}
+              className="rounded-xl border border-emerald-400/40 bg-emerald-700/20 px-4 py-2 text-emerald-100 hover:bg-emerald-700/30 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-emerald-300/60"
+            >
+              OK
+            </AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
+
+      {/* ===== Modal de Zoom (cámara / charts) ===== */}
+      <AlertDialog open={zoomOpen} onOpenChange={setZoomOpen}>
+        <AlertDialogContent
+          className="max-w-5xl rounded-2xl border border-white/15 bg-black/80 text-white"
+        >
+          <div className="flex items-center justify-between">
+            <AlertDialogTitle className="text-white">
+              {zoomKind === "camera" ? "Cámara" : zoomKind === "angle" ? "Ángulo" : "Distancia"}
+            </AlertDialogTitle>
+            <button
+              className="rounded-md p-1 text-white/80 hover:text-white"
+              onClick={() => setZoomOpen(false)}
+              aria-label="Cerrar"
+            >
+              <X className="h-5 w-5" />
+            </button>
+          </div>
+
+          <div className="mt-4">
+            {zoomKind === "camera" && (
+              <img
+                src={cameraUrl}
+                alt="Cámara ampliada"
+                className="mx-auto max-h-[70vh] w-auto rounded-xl border border-white/15"
+              />
+            )}
+            {zoomKind === "angle" && (
+              <BigChart
+                series={angleSeries}
+                unit="°"
+                yMin={0}
+                yMax={3600}
+                stroke="#0b4f9c"
+                title="Ángulo (potenciómetro)"
+              />
+            )}
+            {zoomKind === "distance" && (
+              <BigChart
+                series={distanceSeries}
+                unit="cm"
+                yMin={0}
+                yMax={30}
+                stroke="#0b7d3b"
+                title="Distancia (sensor)"
+              />
+            )}
+          </div>
+        </AlertDialogContent>
+      </AlertDialog>
+    </main>
+  );
+}
+
+/* ========== Luces de comunicación ========== */
+function CommLight({ label, ok }: { label: string; ok: boolean }) {
+  return (
+    <div className="flex items-center gap-2 rounded-xl border border-white/15 bg-black/30 px-3 py-2">
+      <Circle className={cn("h-3 w-3", ok ? "text-emerald-400" : "text-rose-400")} fill="currentColor" />
+      <span className={cn("text-sm", ok ? "text-white/90" : "text-rose-200/90")}>
+        {label} {ok ? "OK" : "ERROR"}
+      </span>
+    </div>
+  );
+}
+
+/* ========== Card de gráfica pequeña (click para zoom) ========== */
+function ChartCard({
+  title, series, unit, yMin, yMax, stroke, onZoom,
+}: {
+  title: string;
+  series: number[];
+  unit: string;
+  yMin: number;
+  yMax: number;
+  stroke: string;
+  onZoom?: () => void;
+}) {
+  return (
+    <div className="rounded-2xl border border-white/15 bg-black/30 p-4 shadow-[0_4px_20px_rgba(0,0,0,0.18)]">
+      <div className="mb-2 flex items-center justify-between">
+        <p className="text-sm font-medium text-white/90">{title}</p>
+        <button
+          onClick={onZoom}
+          className="rounded-md border border-white/15 bg-black/30 px-2 py-1 text-xs text-white/80 hover:bg-black/40"
+          title="Ampliar"
+        >
+          Zoom
+        </button>
+      </div>
+      <MiniChart series={series} unit={unit} yMin={yMin} yMax={yMax} stroke={stroke} />
+    </div>
+  );
+}
+
+/* ========== MiniChart (fondo blanco, ejes y unidades) ========== */
+function MiniChart({
+  series, unit, yMin, yMax, stroke,
+}: {
+  series: number[];
+  unit: string;
+  yMin: number;
+  yMax: number;
+  stroke: string;
+}) {
+  const w = 520, h = 220, padL = 48, padR = 12, padT = 16, padB = 32;
+  return (
+    <ChartSVG
+      series={series}
+      unit={unit}
+      yMin={yMin}
+      yMax={yMax}
+      stroke={stroke}
+      width={w}
+      height={h}
+      padL={padL}
+      padR={padR}
+      padT={padT}
+      padB={padB}
+    />
+  );
+}
+
+/* ========== BigChart (para zoom modal) ========== */
+function BigChart({
+  series, unit, yMin, yMax, stroke, title,
+}: {
+  series: number[];
+  unit: string;
+  yMin: number;
+  yMax: number;
+  stroke: string;
+  title: string;
+}) {
+  const w = 1000, h = 420, padL = 56, padR = 16, padT = 24, padB = 40;
+  return (
+    <div className="rounded-xl border border-white/15 bg-white p-2">
+      <p className="px-2 pt-1 text-sm font-medium text-gray-700">{title}</p>
+      <ChartSVG
+        series={series}
+        unit={unit}
+        yMin={yMin}
+        yMax={yMax}
+        stroke={stroke}
+        width={w}
+        height={h}
+        padL={padL}
+        padR={padR}
+        padT={padT}
+        padB={padB}
+      />
+    </div>
+  );
+}
+
+/* ========== ChartSVG base (SVG con ejes/labels) ========== */
+function ChartSVG({
+  series, unit, yMin, yMax, stroke,
+  width, height, padL, padR, padT, padB,
+}: {
+  series: number[];
+  unit: string;
+  yMin: number;
+  yMax: number;
+  stroke: string;
+  width: number;
+  height: number;
+  padL: number;
+  padR: number;
+  padT: number;
+  padB: number;
+}) {
+  const plotW = width - padL - padR;
+  const plotH = height - padT - padB;
+
+  const n = series.length;
+  const dtSec = 0.15; // mock
+  const xToSec = (i: number) => Math.max(0, (n - 1 - i) * dtSec);
+
+  const yScale = (v: number) => {
+    const t = clamp((v - yMin) / Math.max(1e-6, yMax - yMin), 0, 1);
+    return padT + (1 - t) * plotH;
+  };
+  const xScale = (i: number) => padL + (plotW * i) / Math.max(1, n - 1);
+
+  const pts = useMemo(() => {
+    if (!n) return "";
+    return series.map((v, i) => `${xScale(i)},${yScale(v)}`).join(" ");
+  }, [series, plotW, plotH]);
+
+  const yTicks = 5;
+  const xTicks = 6;
+  const yTickVals = Array.from({ length: yTicks + 1 }, (_, k) => yMin + (k * (yMax - yMin)) / yTicks);
+  const xTickIdxs = Array.from({ length: xTicks + 1 }, (_, k) => Math.round((k * (n - 1)) / xTicks));
+
+  return (
+    <div className="overflow-hidden rounded-xl border border-white/10 bg-white">
+      <svg width="100%" height={height} viewBox={`0 0 ${width} ${height}`} preserveAspectRatio="none">
+        {/* fondo */}
+        <rect x="0" y="0" width={width} height={height} fill="white" />
+
+        {/* área */}
+        <rect x={padL} y={padT} width={plotW} height={plotH} fill="white" stroke="#E5E7EB" />
+
+        {/* ejes */}
+        <line x1={padL} y1={padT} x2={padL} y2={padT + plotH} stroke="#9CA3AF" />
+        <line x1={padL} y1={padT + plotH} x2={padL + plotW} y2={padT + plotH} stroke="#9CA3AF" />
+
+        {/* grid + labels Y */}
+        {yTickVals.map((v, i) => {
+          const y = yScale(v);
+          return (
+            <g key={`y-${i}`}>
+              <line x1={padL} y1={y} x2={padL + plotW} y2={y} stroke="#E5E7EB" />
+              <text x={padL - 6} y={y + 4} textAnchor="end" fontSize="10" fill="#374151">
+                {v.toFixed(0)}
+              </text>
+            </g>
+          );
+        })}
+
+        {/* grid + labels X (tiempo) */}
+        {xTickIdxs.map((idx, i) => {
+          const x = xScale(idx);
+          const sec = xToSec(idx);
+          return (
+            <g key={`x-${i}`}>
+              <line x1={x} y1={padT} x2={x} y2={padT + plotH} stroke="#E5E7EB" />
+              <text x={x} y={padT + plotH + 14} textAnchor="middle" fontSize="10" fill="#374151">
+                {sec.toFixed(0)}s
+              </text>
+            </g>
+          );
+        })}
+
+        {/* serie */}
+        <polyline points={pts} fill="none" stroke={stroke} strokeWidth="2" />
+
+        {/* unidades */}
+        <text x={padL - 34} y={padT - 4} textAnchor="start" fontSize="10" fill="#374151">
+          {unit}
+        </text>
+        <text x={padL + plotW} y={padT + plotH + 26} textAnchor="end" fontSize="10" fill="#374151">
+          tiempo (s)
+        </text>
+      </svg>
     </div>
   );
 }

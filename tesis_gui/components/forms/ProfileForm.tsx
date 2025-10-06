@@ -1,4 +1,3 @@
-"use client";
 import { getCurrentUser } from "@/lib/server/getCurrentUser";
 import { Avatar, AvatarFallback, AvatarImage } from "@/components/ui/avatar";
 

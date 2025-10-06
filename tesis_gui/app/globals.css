@@ -9,7 +9,15 @@
   --font-mono: var(--font-geist-mono);
 }
 
-
+/* app/globals.css */
+@keyframes dialog-shake-x {
+  0%, 100% { transform: translateX(0); }
+  20%, 60%  { transform: translateX(-16px); }
+  40%, 80%  { transform: translateX(16px); }
+}
+.animate-dialog-shake {
+  animation: dialog-shake-x 0.45s;
+}
 
 @layer base {
   :root {

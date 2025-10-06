@@ -4,7 +4,6 @@ import * as React from "react"
 import * as ToastPrimitives from "@radix-ui/react-toast"
 import { cva, type VariantProps } from "class-variance-authority"
 import { X } from "lucide-react"
-
 import { cn } from "@/lib/utils"
 
 const ToastProvider = ToastPrimitives.Provider
@@ -40,6 +39,7 @@ const toastVariants = cva(
   }
 )
 
+// === glass edition ===
 const Toast = React.forwardRef<
   React.ElementRef<typeof ToastPrimitives.Root>,
   React.ComponentPropsWithoutRef<typeof ToastPrimitives.Root> &
@@ -48,7 +48,17 @@ const Toast = React.forwardRef<
   return (
     <ToastPrimitives.Root
       ref={ref}
-      className={cn(toastVariants({ variant }), className)}
+      className={cn(
+        // base layout
+        "group pointer-events-auto relative flex w-full items-center gap-3 overflow-hidden rounded-2xl p-4 shadow-lg transition-all",
+        // efecto vidrio
+        "border border-white/15 bg-white/10 backdrop-blur-xl",
+        // texto
+        "text-white",
+        // variante destructiva (alerta)
+        variant === "destructive" && "border-rose-400/50 bg-rose-500/15",
+        className
+      )}
       {...props}
     />
   )
@@ -77,7 +87,7 @@ const ToastClose = React.forwardRef<
   <ToastPrimitives.Close
     ref={ref}
     className={cn(
-      "absolute right-1 top-1 rounded-md p-1 text-foreground/50 opacity-0 transition-opacity hover:text-foreground focus:opacity-100 focus:outline-none focus:ring-1 group-hover:opacity-100 group-[.destructive]:text-red-300 group-[.destructive]:hover:text-red-50 group-[.destructive]:focus:ring-red-400 group-[.destructive]:focus:ring-offset-red-600",
+      "absolute right-1 top-1 rounded-md p-1 text-white/60 opacity-0 transition-opacity hover:text-white focus:opacity-100 focus:outline-none focus:ring-1 group-hover:opacity-100 group-[.destructive]:text-rose-300 group-[.destructive]:hover:text-rose-50 group-[.destructive]:focus:ring-rose-400 group-[.destructive]:focus:ring-offset-rose-600",
       className
     )}
     toast-close=""
@@ -113,7 +123,6 @@ const ToastDescription = React.forwardRef<
 ToastDescription.displayName = ToastPrimitives.Description.displayName
 
 type ToastProps = React.ComponentPropsWithoutRef<typeof Toast>
-
 type ToastActionElement = React.ReactElement<typeof ToastAction>
 
 export {

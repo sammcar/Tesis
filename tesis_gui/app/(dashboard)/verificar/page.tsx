@@ -1,11 +1,522 @@
-import Link from "next/link";
+// app/(dashboard)/verificar/page.tsx
+"use client";
 
-export default function VerificarMenu() {
+import { useEffect, useMemo, useRef, useState } from "react";
+import Link from "next/link";
+import { ArrowLeft, Power, RefreshCcw, Camera, TerminalSquare } from "lucide-react";
+
+import {
+  AlertDialog,
+  AlertDialogAction,
+  AlertDialogContent,
+  AlertDialogDescription,
+  AlertDialogFooter,
+  AlertDialogHeader,
+  AlertDialogTitle,
+} from "@/components/ui/alert-dialog";
+
+type Mode = "ciclo" | "etapa" | "manual";
+
+export default function VerificarPage() {
+  // ---- Estado global ----
+  const [mode, setMode] = useState<Mode>("ciclo");
+  const [isOn, setIsOn] = useState<boolean>(false);
+  const [estopActive, setEstopActive] = useState<boolean>(false);
+
+  // Consola / variables simuladas
+  const [logs, setLogs] = useState<string[]>([
+    "Sistema listo.",
+    "MQTT: desconectado (mock)",
+  ]);
+  const [inputLine, setInputLine] = useState<string>("");
+
+  // Cámara mock (refresco)
+  const [cameraTick, setCameraTick] = useState<number>(0);
+  const cameraRefreshMs = 3000;
+  const cameraUrl = useMemo(
+    () => `https://picsum.photos/seed/electrospinning-${cameraTick}/960/540`,
+    [cameraTick]
+  );
+
+  // Falla: modal + latch
+  const [faultOpen, setFaultOpen] = useState(false);
+  const [faultLatched, setFaultLatched] = useState(false); // << bloquea todos los controles hasta resetear
+  const [faultTitle, setFaultTitle] = useState<string>("");
+  const [faultDesc, setFaultDesc] = useState<string>("");
+  const [shakeTick, setShakeTick] = useState(0); // reiniciar animación en cada nueva falla
+
+  function showFault(title: string, description: string) {
+    setFaultTitle(title);
+    setFaultDesc(description);
+    setFaultLatched(true);  // << activa latch
+    setFaultOpen(true);     // muestra modal
+    setShakeTick((t) => t + 1);
+    // En producción, aquí podrías disparar sonidos/luces, etc.
+  }
+
+  // MOCK: dispara una falla cada ~20s
+  useEffect(() => {
+    const id = setInterval(() => {
+      const payload = { code: "E42", message: "Sobrevoltaje en HV supply" };
+      showFault(`Falla ${payload.code}`, payload.message);
+      setLogs((prev) => [`[FAULT] ${payload.code}: ${payload.message}`, ...prev].slice(0, 200));
+    }, 20000);
+    return () => clearInterval(id);
+  }, []);
+
+  // Logs periódicos
+  useEffect(() => {
+    const id = setInterval(() => {
+      const now = new Date().toLocaleTimeString();
+      const line = isOn
+        ? `[${now}] Telemetría: OK · temp=22°C · hum=30%`
+        : `[${now}] Sistema en standby.`;
+      setLogs((prev) => [line, ...prev].slice(0, 200));
+    }, 3000);
+    return () => clearInterval(id);
+  }, [isOn]);
+
+  // Refresco de cámara (si hay falla, no refrescamos automáticamente)
+  useEffect(() => {
+    const id = setInterval(() => {
+      if (!faultLatched) setCameraTick((t) => t + 1);
+    }, cameraRefreshMs);
+    return () => clearInterval(id);
+  }, [faultLatched]);
+
+  // Envío de comandos (mock)
+  const sendCommand = (cmd: string) => {
+    if (!cmd.trim()) return;
+    const now = new Date().toLocaleTimeString();
+    setLogs((prev) => [`[${now}] → ${cmd}`, ...prev].slice(0, 200));
+    // TODO: publicar por MQTT el comando enviado
+  };
+
+  // Botones globales
+  const togglePower = () => {
+    if (estopActive || faultLatched) return;
+    setIsOn((v) => !v);
+    sendCommand(!isOn ? "POWER ON" : "POWER OFF");
+  };
+
+  const toggleEstop = () => {
+    if (faultLatched) return; // << durante una falla, STOP/OK no opera
+    const next = !estopActive;
+    setEstopActive(next);
+    setIsOn(next ? false : isOn); // seguridad: al activar STOP apagamos
+    sendCommand(next ? "E-STOP ACTIVADO" : "E-STOP LIBERADO");
+  };
+
+  const handleReset = () => {
+    if (estopActive || faultLatched) return; // << bloqueado en falla o STOP
+    setLogs((prev) => ["Reset ejecutado.", ...prev].slice(0, 200));
+    // TODO: enviar comando reset por MQTT
+  };
+
+  // Nuevo: Reset de fallas (único botón activo durante la falla)
+  const handleFaultReset = () => {
+    setFaultOpen(false);     // cierra modal si estuviera abierto
+    setFaultLatched(false);  // libera latch => re-habilita controles
+    setLogs((prev) => ["Falla reseteada por operador.", ...prev].slice(0, 200));
+    // TODO: publicar por MQTT: ack/reset de fallas
+  };
+
+  // Consola
+  const inputRef = useRef<HTMLInputElement>(null);
+  const onSubmitConsole = () => {
+    sendCommand(inputLine);
+    setInputLine("");
+    inputRef.current?.focus();
+  };
+
+  // Deshabilitaciones comunes
+  const commonDisabled = estopActive || faultLatched || !isOn;
+  const glass = "border border-white/15 bg-white/10 backdrop-blur-lg";
+  const card = `rounded-2xl ${glass} p-4 shadow-[0_8px_30px_rgba(0,0,0,0.12)]`;
+  const titleClass = "text-sm font-medium text-white/90";
+
   return (
-    <section className="grid gap-6 md:grid-cols-3">
-      <Link href="/verificar/ciclo"  className="rounded-2xl border p-6 hover:bg-gray-50">Verificación por ciclo</Link>
-      <Link href="/verificar/etapa"  className="rounded-2xl border p-6 hover:bg-gray-50">Verificación por etapa</Link>
-      <Link href="/verificar/manual" className="rounded-2xl border p-6 hover:bg-gray-50">Verificación manual</Link>
+    <section className="mx-auto w-full max-w-6xl p-6 md:p-10">
+      {/* Header */}
+      <div className="mb-6 flex items-center justify-between">
+        <h1 className="text-2xl font-semibold tracking-tight text-white">
+          Verificar componentes
+        </h1>
+        <Link
+          href="/menu"
+          className="inline-flex items-center gap-2 rounded-xl border border-white/15 bg-white/10 px-3 py-2 text-sm text-white/90 backdrop-blur-md transition hover:bg-white/15 focus:outline-none focus:ring-2 focus:ring-white/30"
+        >
+          <ArrowLeft className="h-4 w-4" />
+          Volver
+        </Link>
+      </div>
+
+      {/* Selector de modo */}
+      <div className={`${card} mb-6`}>
+        <p className={titleClass}>Modo de verificación</p>
+        <div className="mt-2 inline-flex rounded-xl border border-white/15 bg-white/10 p-1">
+          {(["ciclo", "etapa", "manual"] as Mode[]).map((m) => (
+            <button
+              key={m}
+              type="button"
+              onClick={() => setMode(m)}
+              className={[
+                "px-4 py-2 text-sm font-medium rounded-lg transition",
+                mode === m
+                  ? "bg-white/20 text-white"
+                  : "text-white/70 hover:bg-white/10",
+              ].join(" ")}
+              aria-pressed={mode === m}
+              disabled={estopActive || faultLatched}
+            >
+              {m === "ciclo" ? "Ciclo a ciclo" : m === "etapa" ? "Etapa a etapa" : "Manual"}
+            </button>
+          ))}
+        </div>
+      </div>
+
+      {/* Grid principal */}
+      <div className="grid grid-cols-1 gap-6 lg:grid-cols-12">
+        {/* Izquierda: consola + cámara */}
+        <div className="lg:col-span-8 space-y-6">
+          {/* Consola */}
+          <div className={card}>
+            <div className="mb-3 flex items-center gap-2">
+              <TerminalSquare className="h-5 w-5 text-white/80" />
+              <p className={titleClass}>Consola (MQTT mock)</p>
+            </div>
+
+            <div className="mb-3 flex flex-wrap gap-2 text-xs">
+              <span className="rounded-lg border border-white/15 bg-white/10 px-2 py-1 text-white/80">
+                Modo: <b className="ml-1 text-white">{mode}</b>
+              </span>
+              <span className="rounded-lg border border-white/15 bg-white/10 px-2 py-1 text-white/80">
+                Energía:{" "}
+                <b className={`ml-1 ${isOn ? "text-emerald-300" : "text-white/70"}`}>
+                  {isOn ? "ON" : "OFF"}
+                </b>
+              </span>
+              <span className="rounded-lg border border-white/15 bg-white/10 px-2 py-1 text-white/80">
+                E-STOP:{" "}
+                <b className={`ml-1 ${estopActive ? "text-rose-300" : "text-white/70"}`}>
+                  {estopActive ? "ACTIVO" : "LIBRE"}
+                </b>
+              </span>
+              <span className="rounded-lg border border-white/15 bg-white/10 px-2 py-1 text-white/80">
+                Falla:{" "}
+                <b className={`ml-1 ${faultLatched ? "text-rose-300" : "text-white/70"}`}>
+                  {faultLatched ? "LATCHED" : "OK"}
+                </b>
+              </span>
+            </div>
+
+            {/* Input + Enviar */}
+            <div className="mb-3 flex gap-2">
+              <input
+                ref={inputRef}
+                className="min-w-0 flex-1 rounded-xl border border-white/15 bg-white/10 px-3 py-2 text-white placeholder:text-white/50 focus:outline-none focus:ring-2 focus:ring-white/30"
+                placeholder="Escribe un comando (mock) y presiona Enviar"
+                value={inputLine}
+                onChange={(e) => setInputLine(e.target.value)}
+                onKeyDown={(e) => {
+                  if (e.key === "Enter") onSubmitConsole();
+                }}
+                disabled={estopActive || faultLatched}
+              />
+              <button
+                onClick={onSubmitConsole}
+                disabled={estopActive || faultLatched || !inputLine.trim()}
+                className={[
+                  "rounded-xl px-4 py-2 text-sm font-medium transition",
+                  "border border-white/15 bg-white/10",
+                  estopActive || faultLatched || !inputLine.trim()
+                    ? "text-white/50"
+                    : "text-white hover:bg-white/15",
+                ].join(" ")}
+              >
+                Enviar
+              </button>
+            </div>
+
+            {/* Logs */}
+            <div className="h-56 overflow-auto rounded-xl border border-white/10 bg-zinc-900/40 p-3">
+              <ul className="space-y-1 font-mono text-xs text-zinc-100/90">
+                {logs.map((line, i) => (
+                  <li key={i}>{line}</li>
+                ))}
+              </ul>
+            </div>
+          </div>
+
+          {/* Cámara */}
+          <div className={card}>
+            <div className="mb-3 flex items-center justify-between">
+              <div className="flex items-center gap-2">
+                <Camera className="h-5 w-5 text-white/80" />
+                <p className={titleClass}>Cámara (ESP32-CAM · mock)</p>
+              </div>
+              <button
+                type="button"
+                onClick={() => !faultLatched && setCameraTick((t) => t + 1)}
+                className="inline-flex items-center gap-2 rounded-xl border border-white/15 bg-white/10 px-3 py-2 text-xs text-white/90 hover:bg-white/15"
+                disabled={estopActive || faultLatched}
+                title="Refrescar snapshot"
+              >
+                <RefreshCcw className="h-4 w-4" />
+                Refrescar
+              </button>
+            </div>
+            <div className="overflow-hidden rounded-xl border border-white/10 bg-black/40">
+              <img
+                src={cameraUrl}
+                alt="Snapshot cámara (mock)"
+                className="h-auto w-full object-cover"
+              />
+            </div>
+            <p className="mt-2 text-xs text-white/70">
+              Snapshot mock cada ~{cameraRefreshMs / 1000}s.
+            </p>
+          </div>
+        </div>
+
+        {/* Derecha: controles y modo */}
+        <div className="lg:col-span-4 space-y-6">
+          {/* Controles globales */}
+          <div className={card}>
+            <p className={titleClass}>Controles globales</p>
+            <div className="mt-3 grid grid-cols-1 gap-3">
+              {/* Power */}
+              <button
+                type="button"
+                onClick={togglePower}
+                disabled={estopActive || faultLatched}
+                className={[
+                  "rounded-xl px-4 py-3 text-sm font-semibold transition",
+                  estopActive || faultLatched
+                    ? "cursor-not-allowed opacity-50"
+                    : isOn
+                    ? "bg-emerald-600 text-white hover:bg-emerald-500"
+                    : "border border-white/15 bg-white/10 text-white hover:bg-white/15",
+                ].join(" ")}
+              >
+                <span className="inline-flex items-center gap-2">
+                  <Power className="h-4 w-4" />
+                  {isOn ? "Apagar" : "Encender"}
+                </span>
+              </button>
+
+              {/* STOP / OK (deshabilitado durante falla) */}
+              <button
+                type="button"
+                onClick={toggleEstop}
+                disabled={faultLatched}
+                className={[
+                  "rounded-xl px-4 py-3 text-sm font-semibold transition",
+                  faultLatched
+                    ? "cursor-not-allowed opacity-50"
+                    : estopActive
+                    ? "bg-emerald-600 text-white hover:bg-emerald-500"
+                    : "bg-rose-600 text-white hover:bg-rose-500",
+                ].join(" ")}
+                title={estopActive ? "Liberar paro" : "Activar paro de emergencia"}
+              >
+                {estopActive ? "OK" : "STOP"}
+              </button>
+
+              {/* Reset normal (bloqueado en STOP o Falla) */}
+              <button
+                type="button"
+                onClick={handleReset}
+                disabled={estopActive || faultLatched}
+                className={[
+                  "rounded-xl px-4 py-3 text-sm font-semibold transition",
+                  estopActive || faultLatched
+                    ? "cursor-not-allowed opacity-50"
+                    : "border border-white/15 bg-white/10 text-white hover:bg-white/15",
+                ].join(" ")}
+                title="Reset suave (limpia logs)"
+              >
+                <span className="inline-flex items-center gap-2">
+                  <RefreshCcw className="h-4 w-4" />
+                  Reset
+                </span>
+              </button>
+
+              {/* Reset de fallas (único activo durante la falla) */}
+              <button
+                type="button"
+                onClick={handleFaultReset}
+                disabled={!faultLatched}
+                className={[
+                  "rounded-xl px-4 py-3 text-sm font-semibold transition",
+                  faultLatched
+                    ? "border border-rose-400/40 bg-rose-700/20 text-rose-100 hover:bg-rose-700/30"
+                    : "cursor-not-allowed opacity-50",
+                ].join(" ")}
+                title="Liberar latch de falla y re-habilitar controles"
+              >
+                Reset de fallas
+              </button>
+            </div>
+          </div>
+
+          {/* Acciones por modo */}
+          <div className={card}>
+            <p className={titleClass}>Acciones del modo</p>
+            <div className="mt-3 space-y-3">
+              {mode === "ciclo" && (
+                <button
+                  type="button"
+                  onClick={() => sendCommand("SIGUIENTE CICLO")}
+                  disabled={commonDisabled}
+                  className={[
+                    "w-full rounded-xl px-4 py-3 text-sm font-semibold transition",
+                    commonDisabled
+                      ? "cursor-not-allowed opacity-50"
+                      : "border border-white/15 bg-white/10 text-white hover:bg-white/15",
+                  ].join(" ")}
+                >
+                  Siguiente ciclo
+                </button>
+              )}
+
+              {mode === "etapa" && (
+                <button
+                  type="button"
+                  onClick={() => sendCommand("SIGUIENTE ETAPA")}
+                  disabled={commonDisabled}
+                  className={[
+                    "w-full rounded-xl px-4 py-3 text-sm font-semibold transition",
+                    commonDisabled
+                      ? "cursor-not-allowed opacity-50"
+                      : "border border-white/15 bg-white/10 text-white hover:bg-white/15",
+                  ].join(" ")}
+                >
+                  Siguiente etapa
+                </button>
+              )}
+
+              {mode === "manual" && (
+                <div className="grid grid-cols-1 gap-3">
+                  <ToggleRow
+                    label="Jeringa"
+                    disabled={commonDisabled}
+                    onToggle={(v) => sendCommand(`JERINGA ${v ? "ON" : "OFF"}`)}
+                  />
+                  <ToggleRow
+                    label="Variac"
+                    disabled={commonDisabled}
+                    onToggle={(v) => sendCommand(`VARIAC ${v ? "ON" : "OFF"}`)}
+                  />
+                  <ToggleRow
+                    label="Giro Colector"
+                    disabled={commonDisabled}
+                    onToggle={(v) => sendCommand(`GIRO COLECTOR ${v ? "ON" : "OFF"}`)}
+                  />
+                  <ToggleRow
+                    label="Actuador Lineal"
+                    disabled={commonDisabled}
+                    onToggle={(v) => sendCommand(`ACTUADOR LINEAL ${v ? "ON" : "OFF"}`)}
+                  />
+                </div>
+              )}
+            </div>
+          </div>
+
+          {/* Modal de Falla (shake + rojo) */}
+          <AlertDialog open={faultOpen} onOpenChange={setFaultOpen}>
+            <AlertDialogContent
+              className={[
+                "max-w-md rounded-2xl",
+                "border border-rose-400/40 bg-rose-600/20 backdrop-blur-2xl",
+                "text-white shadow-[0_8px_30px_rgba(255,0,0,0.35)]",
+                "animate-in fade-in duration-300",
+              ].join(" ")}
+            >
+              <div key={shakeTick} className="will-change-transform animate-[dialog-shake-x_0.45s]">
+                <AlertDialogHeader>
+                  <AlertDialogTitle className="text-rose-300 font-semibold tracking-wide">
+                    {faultTitle || "Falla detectada"}
+                  </AlertDialogTitle>
+                  <AlertDialogDescription className="whitespace-pre-line text-rose-100/90">
+                    {faultDesc || "Revisar el sistema y reintentar."}
+                  </AlertDialogDescription>
+                </AlertDialogHeader>
+
+                <AlertDialogFooter>
+                  {/* Nota: OK solo cierra el modal visual, el latch sigue activo */}
+                  <AlertDialogAction
+                    onClick={() => setFaultOpen(false)}
+                    className="rounded-xl border border-rose-400/40 bg-rose-700/20 px-4 py-2 text-rose-100 hover:bg-rose-700/30 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-rose-300/60"
+                  >
+                    OK
+                  </AlertDialogAction>
+                </AlertDialogFooter>
+              </div>
+            </AlertDialogContent>
+          </AlertDialog>
+        </div>
+      </div>
     </section>
+  );
+}
+
+/** ToggleRow reutilizable */
+function ToggleRow({
+  label,
+  disabled,
+  onToggle,
+}: {
+  label: string;
+  disabled?: boolean;
+  onToggle?: (on: boolean) => void;
+}) {
+  const [on, setOn] = useState(false);
+  const glass = "border border-white/15 bg-white/10 backdrop-blur-md";
+
+  const click = (next: boolean) => {
+    if (disabled) return;
+    setOn(next);
+    onToggle?.(next); // TODO: publicar por MQTT el cambio
+  };
+
+  return (
+    <div className="flex items-center justify-between gap-3">
+      <span className="text-white/90">{label}</span>
+      <div className={`inline-flex rounded-xl p-1 ${glass}`}>
+        <button
+          type="button"
+          onClick={() => click(true)}
+          disabled={disabled}
+          className={[
+            "px-4 py-2 text-sm font-medium rounded-lg transition",
+            disabled
+              ? "text-white/40"
+              : on
+              ? "bg-white/20 text-white"
+              : "text-white/70 hover:bg-white/10",
+          ].join(" ")}
+          aria-pressed={on}
+        >
+          On
+        </button>
+        <button
+          type="button"
+          onClick={() => click(false)}
+          disabled={disabled}
+          className={[
+            "px-4 py-2 text-sm font-medium rounded-lg transition",
+            disabled
+              ? "text-white/40"
+              : !on
+              ? "bg-white/20 text-white"
+              : "text-white/70 hover:bg-white/10",
+          ].join(" ")}
+          aria-pressed={!on}
+        >
+          Off
+        </button>
+      </div>
+    </div>
   );
 }
