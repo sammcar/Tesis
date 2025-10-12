@@ -1,6 +1,7 @@
 // app/(dashboard)/monitoreo/page.tsx
 "use client";
 
+import { subscribeLogs, publishText, subscribeSeries, subscribeState, subscribeFault, DEVICE_ID } from "@/lib/mqttClient";
 import { useEffect, useMemo, useRef, useState } from "react";
 import Link from "next/link";
 import { useRouter } from "next/navigation";
@@ -46,7 +47,7 @@ export default function MonitoreoPage() {
   );
 
   // ----- series (mock) -----
-  const [angleSeries, setAngleSeries] = useState<number[]>([]);
+  const [voltageSeries, setvoltageSeries] = useState<number[]>([]);
   const [distanceSeries, setDistanceSeries] = useState<number[]>([]);
 
   // ----- luces -----
@@ -67,7 +68,7 @@ export default function MonitoreoPage() {
 
   // ----- zoom modal (cámara / charts) -----
   const [zoomOpen, setZoomOpen] = useState(false);
-  const [zoomKind, setZoomKind] = useState<"camera" | "angle" | "distance" | null>(null);
+  const [zoomKind, setZoomKind] = useState<"camera" | "voltage" | "distance" | null>(null);
 
   // ----- refs para bucles estables (evitar “max depth”) -----
   const runningRef = useRef(true);                 // gobierna timer
@@ -76,6 +77,11 @@ export default function MonitoreoPage() {
   const finishRef = useRef(false);
   // arriba, junto a otros useRef/useState:
   const splineCanvasRef = useRef<HTMLCanvasElement | null>(null);
+
+  const powerBusyRef = useRef(false);
+  const lastStartTsRef = useRef(0);
+  const bcRef = useRef<BroadcastChannel | null>(null);
+
 
   // mantener refs sincronizadas
   useEffect(() => { estopRef.current = estopActive; }, [estopActive]);
@@ -125,26 +131,29 @@ export default function MonitoreoPage() {
     raf = requestAnimationFrame(loop);
     return () => cancelAnimationFrame(raf);
   }, []);
-
-  // ======== Series mock: un solo setInterval de por vida ========
+  
   useEffect(() => {
-    const id = setInterval(() => {
-      if (estopRef.current || faultRef.current || finishRef.current) return;
-      const angle = 1800 + 1200 * Math.sin(Date.now() / 800);
-      const dist  = 15 + 10 * Math.cos(Date.now() / 900);
-      setAngleSeries(s => {
-        const next = [...s, angle];
-        if (next.length > 600) next.shift();
-        return next;
-      });
-      setDistanceSeries(s => {
-        const next = [...s, dist];
-        if (next.length > 600) next.shift();
-        return next;
-      });
-    }, 150);
-    return () => clearInterval(id);
-  }, []);
+  // VOLTAJE (kV)
+  const offV = subscribeSeries(DEVICE_ID, "voltage_kv", (v) => {
+    setvoltageSeries(s => {
+      const next = [...s, v];
+      if (next.length > 600) next.shift();
+      return next;
+    });
+  });
+
+  // DISTANCIA (mm)
+  const offD = subscribeSeries(DEVICE_ID, "distance_mm", (v) => {
+    setDistanceSeries(s => {
+      const next = [...s, v];
+      if (next.length > 600) next.shift();
+      return next;
+    });
+  });
+
+  return () => { offV?.(); offD?.(); };
+}, []);
+
 
   // ======== Cámara (mock) ========
   useEffect(() => {
@@ -155,17 +164,24 @@ export default function MonitoreoPage() {
     return () => clearInterval(id);
   }, []);
 
-  // ======== Logs periódicos (mock) ========
   useEffect(() => {
-    const id = setInterval(() => {
-      const now = new Date().toLocaleTimeString();
-      const line = (!estopRef.current && !faultRef.current && !finishRef.current)
-        ? `[${now}] Telemetría: OK · angle=${(angleSeries.at(-1) ?? 0).toFixed(1)}° · dist=${(distanceSeries.at(-1) ?? 0).toFixed(1)}cm`
-        : `[${now}] Sistema en pausa.`;
-      setLogs(p => [line, ...p].slice(0, 300));
-    }, 3000);
-    return () => clearInterval(id);
-  }, [angleSeries, distanceSeries]);
+  sendCommand("modo automatico");
+  // (Opcional) suscribirse al estado y reflejar en UI:
+  const unsub = subscribeState(DEVICE_ID, (st) => {
+    // si quieres, sincroniza estop/fallo/isOn/etapa desde el ESP32
+    if (typeof st?.fallo === "boolean") setFaultLatched(st.fallo);
+  });
+  return () => unsub?.();
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+}, []);
+
+    // Logs reales desde el ESP32 (tesis/<id>/log/text y ack)
+  useEffect(() => {
+    const off = subscribeLogs(DEVICE_ID, (line) => {
+      setLogs((p) => [line, ...p].slice(0, 300));
+    });
+    return () => off?.();
+  }, []);
 
   // // ======== Fin de prueba mock (cada ~45s) ========
   // useEffect(() => {
@@ -184,6 +200,40 @@ export default function MonitoreoPage() {
     return () => clearInterval(id);
   }, []);
 
+  useEffect(() => {
+  const off = subscribeFault(DEVICE_ID, (f) => {
+    if (!f) return; // llegó "{}" → no abrir popup
+    setFaultTitle(`Falla ${f.code ?? "FALLA"}`);
+    setFaultDesc(
+      `Detalle: ${f.message ?? "Revisar el sistema"}${
+        typeof f.etapa === "number" ? `\nEtapa: ${f.etapa}` : ""
+      }`
+    );
+    setFaultLatched(true);
+    setFaultOpen(true);
+    setShakeTick((t) => t + 1);
+    setLogs((p) => [`[FAULT] ${f.code}: ${f.message}`, ...p].slice(0, 300));
+  });
+  return () => off?.();
+}, []);
+
+// coordinar con otras pestañas/instancias
+useEffect(() => {
+  const bc = new BroadcastChannel("tesis-cmd");
+  bcRef.current = bc;
+
+  bc.onmessage = (ev) => {
+    if (ev?.data?.type === "cmd" && ev.data.line === "start") {
+      // otra instancia acaba de mandar 'start' → marca timestamp local para que esta lo ignore
+      lastStartTsRef.current = ev.data.ts || Date.now();
+      // si quieres, dispara SOLO la animación Spline aquí para mantener la UI simétrica
+      // fireSplineDouble(splineCanvasRef.current, "s");
+    }
+  };
+
+  return () => bc.close();
+}, []);
+
   // acciones
   const panel = "rounded-2xl border border-white/15 bg-black/30 p-4 shadow-[0_4px_20px_rgba(0,0,0,0.18)]"; // sin blur
   const title = "text-sm font-medium text-white/90";
@@ -193,8 +243,9 @@ export default function MonitoreoPage() {
     if (!cmd.trim()) return;
     const now = new Date().toLocaleTimeString();
     setLogs(p => [`[${now}] → ${cmd}`, ...p].slice(0, 300));
-    // TODO: MQTT publish
+    publishText(DEVICE_ID, cmd);
   };
+
 
   // helper reutilizable
 function fireSplineKeyPress(canvas: HTMLCanvasElement | null, key = "s") {
@@ -213,54 +264,84 @@ function fireSplineKeyPress(canvas: HTMLCanvasElement | null, key = "s") {
     }, 80);
 }
 
-  // en tu componente
-  const togglePower = () => {
-    if (globalDisabled) return;
+function publishStartOnce() {
+  const now = Date.now();
 
-    setIsOn(prev => {
-      const next = !prev;
-      sendCommand(next ? "POWER ON" : "POWER OFF");
+  // rate-limit global (compartido entre instancias vía BroadcastChannel)
+  if (now - lastStartTsRef.current < 350) {
+    // opcional: solo animación, sin mandar otro 'start'
+    fireSplineDouble(splineCanvasRef.current, "s");
+    setLogs(p => [`[Spline] key 's' ×2 (drop dup start)`, ...p].slice(0, 300));
+    return;
+  }
 
-      // Dispara SIEMPRE la tecla "s" (keydown+keyup) al encender y también al apagar
-      fireSplineKeyPress(splineCanvasRef.current, "s");
+  lastStartTsRef.current = now;
+  bcRef.current?.postMessage({ type: "cmd", line: "start", ts: now });
+  sendCommand("start");
+}
 
-      setLogs(p => [
-        `[Spline] key 's' disparada por ${next ? "POWER ON" : "POWER OFF"}`,
-        ...p,
-      ].slice(0, 300));
+function fireSplineDouble(canvas: HTMLCanvasElement | null, key = "s") {
+  if (!canvas) return;
+  // 1ª pulsación
+  fireSplineKeyPress(canvas, key);
+  // 2ª pulsación con un pequeño delay (ajústalo si tu Spline lo necesita)
+  //setTimeout(() => fireSplineKeyPress(canvas, key), 120);
+}
 
-      return next;
-    });
-  };
+  // Power: NO se deshabilita por estop; la GUI decide.
+// Si hay estop, primero enviamos "ok" y luego "start".
+const togglePower = () => {
+  // Bloqueos duros: falla/fin/estop
+  if (faultLatched || finishOpen || estopActive) return;
 
+  // anti-reentrada local (doble click)
+  if (powerBusyRef.current) return;
+  powerBusyRef.current = true;
+  setTimeout(() => { powerBusyRef.current = false; }, 300);
 
-  const toggleEstop = () => {
-    const next = !estopActive;
-    setEstopActive(next);
-    if (next) {
-      setIsOn(false);
-      runningRef.current = false;
-      setLogs(p => ["E-STOP ACTIVADO", ...p].slice(0, 300));
-    } else {
-      runningRef.current = true;
-      setLogs(p => ["E-STOP LIBERADO", ...p].slice(0, 300));
-    }
-  };
+  setIsOn(prev => {
+    const next = !prev;
 
-  const handleReset = () => {
-    if (globalDisabled) return;
-    setLogs(p => ["Reset ejecutado.", ...p].slice(0, 300));
-    setElapsedMs(0);
-    // TODO: MQTT publish RESET
-  };
+    // ← UN SOLO 'start' para todas las instancias
+    publishStartOnce();
 
-  const handleFaultReset = () => {
-    if (!faultLatched) return;
-    setFaultLatched(false);
-    setFaultOpen(false);
-    setLogs(p => ["Fallas reiniciadas (latch liberado).", ...p].slice(0, 300));
-    // TODO: MQTT publish RESET_FAULTS
-  };
+    // ← pero tu animación va en doble 's'
+    fireSplineDouble(splineCanvasRef.current, "s");
+
+    setLogs(p => [
+      `[Spline] key 's' ×2 disparada por ${next ? "POWER ON" : "POWER OFF"}`,
+      ...p,
+    ].slice(0, 300));
+
+    return next;
+  });
+};
+
+const toggleEstop = () => {
+  if (faultLatched) return;
+  if (estopActive) {
+    sendCommand("ok");
+    setEstopActive(false);            // ⬅️ NO toques isOn aquí
+  } else {
+    sendCommand("paro");
+    setEstopActive(true);             // ⬅️ NO hagas setIsOn(false)
+    // ⛔ QUITADO: setIsOn(false)
+  }
+};
+
+const handleReset = () => {
+  if (faultLatched) return;
+  setLogs((prev) => ["Reset ejecutado.", ...prev].slice(0, 200));
+  sendCommand("reset");
+  // (opcional) sin tocar isOn; la GUI sigue mandando
+};
+
+const handleFaultReset = () => {
+  setFaultOpen(false);
+  setFaultLatched(false);
+  setLogs((prev) => ["Falla reseteada por operador.", ...prev].slice(0, 200));
+  sendCommand("rfalla");
+};
 
   const showFault = (title: string, desc: string) => {
     setFaultLatched(true);
@@ -289,7 +370,7 @@ function fireSplineKeyPress(canvas: HTMLCanvasElement | null, key = "s") {
   };
 
   // zoom handlers
-  const openZoom = (kind: "camera" | "angle" | "distance") => {
+  const openZoom = (kind: "camera" | "voltage" | "distance") => {
     setZoomKind(kind);
     setZoomOpen(true);
   };
@@ -366,6 +447,7 @@ function fireSplineKeyPress(canvas: HTMLCanvasElement | null, key = "s") {
                 </span>
               </button>
 
+
               <button
                 type="button"
                 onClick={toggleEstop}
@@ -383,7 +465,7 @@ function fireSplineKeyPress(canvas: HTMLCanvasElement | null, key = "s") {
               <button
                 type="button"
                 onClick={handleReset}
-                disabled={estopActive || faultLatched || finishOpen}
+                disabled={faultLatched || finishOpen}
                 className={cn(
                   "rounded-xl px-4 py-3 text-sm font-semibold transition",
                   estopActive || faultLatched || finishOpen
@@ -426,14 +508,25 @@ function fireSplineKeyPress(canvas: HTMLCanvasElement | null, key = "s") {
               <input
                 ref={inputRef}
                 className="min-w-0 flex-1 rounded-xl border border-white/15 bg-black/30 px-3 py-2 text-white placeholder:text-white/50 focus:outline-none focus:ring-2 focus:ring-white/30"
-                placeholder="Escribe un comando (mock) y presiona Enviar"
+                placeholder="Escribe un comando y presiona Enviar"
                 value={inputLine}
                 onChange={(e) => setInputLine(e.target.value)}
-                onKeyDown={(e) => e.key === "Enter" && inputLine.trim() && setLogs(p => [`→ ${inputLine}`, ...p].slice(0, 300))}
+                onKeyDown={(e) => {
+                  if (e.key === "Enter" && inputLine.trim()) {
+                    sendCommand(inputLine);
+                    setInputLine("");
+                    inputRef.current?.focus();
+                  }
+                }}
                 disabled={estopActive || faultLatched || finishOpen}
               />
               <button
-                onClick={() => inputLine.trim() && setLogs(p => [`→ ${inputLine}`, ...p].slice(0, 300))}
+                onClick={() => {
+                  if (!inputLine.trim()) return;
+                  sendCommand(inputLine);
+                  setInputLine("");
+                  inputRef.current?.focus();
+                }}
                 disabled={estopActive || faultLatched || finishOpen || !inputLine.trim()}
                 className={cn(
                   "rounded-xl px-4 py-2 text-sm font-medium transition",
@@ -492,21 +585,21 @@ function fireSplineKeyPress(canvas: HTMLCanvasElement | null, key = "s") {
 
           {/* gráficas */}
           <ChartCard
-            title="Ángulo (potenciómetro)"
-            onZoom={() => openZoom("angle")}
-            series={angleSeries}
-            unit="°"
+            title="Voltaje (kV)"
+            onZoom={() => openZoom("voltage")}
+            series={voltageSeries}
+            unit="kV"
             yMin={0}
-            yMax={3600}
+            yMax={40}
             stroke="#0b4f9c"
           />
           <ChartCard
-            title="Distancia (sensor)"
+            title="Distancia (mm)"
             onZoom={() => openZoom("distance")}
             series={distanceSeries}
-            unit="cm"
+            unit="mm"
             yMin={0}
-            yMax={30}
+            yMax={300}
             stroke="#0b7d3b"
           />
 
@@ -590,7 +683,7 @@ function fireSplineKeyPress(canvas: HTMLCanvasElement | null, key = "s") {
         >
           <div className="flex items-center justify-between">
             <AlertDialogTitle className="text-white">
-              {zoomKind === "camera" ? "Cámara" : zoomKind === "angle" ? "Ángulo" : "Distancia"}
+              {zoomKind === "camera" ? "Cámara" : zoomKind === "voltage" ? "Ángulo" : "Distancia"}
             </AlertDialogTitle>
             <button
               className="rounded-md p-1 text-white/80 hover:text-white"
@@ -609,24 +702,24 @@ function fireSplineKeyPress(canvas: HTMLCanvasElement | null, key = "s") {
                 className="mx-auto max-h-[70vh] w-auto rounded-xl border border-white/15"
               />
             )}
-            {zoomKind === "angle" && (
+            {zoomKind === "voltage" && (
               <BigChart
-                series={angleSeries}
-                unit="°"
+                series={voltageSeries}
+                unit="kV"
                 yMin={0}
-                yMax={3600}
+                yMax={40}
                 stroke="#0b4f9c"
-                title="Ángulo (potenciómetro)"
+                title="Voltaje (kV)"
               />
             )}
             {zoomKind === "distance" && (
               <BigChart
                 series={distanceSeries}
-                unit="cm"
+                unit="mm"
                 yMin={0}
-                yMax={30}
+                yMax={300}
                 stroke="#0b7d3b"
-                title="Distancia (sensor)"
+                title="Distancia (mm)"
               />
             )}
           </div>

@@ -1,6 +1,7 @@
 // app/(dashboard)/verificar/page.tsx
 "use client";
 
+import { subscribeLogs, publishText, subscribeState, subscribeFault, DEVICE_ID } from "@/lib/mqttClient";
 import { useEffect, useMemo, useRef, useState } from "react";
 import Link from "next/link";
 import { ArrowLeft, Power, RefreshCcw, Camera, TerminalSquare } from "lucide-react";
@@ -26,7 +27,7 @@ export default function VerificarPage() {
   // Consola / variables simuladas
   const [logs, setLogs] = useState<string[]>([
     "Sistema listo.",
-    "MQTT: desconectado (mock)",
+    "MQTT: desconectado",
   ]);
   const [inputLine, setInputLine] = useState<string>("");
 
@@ -40,43 +41,48 @@ export default function VerificarPage() {
 
   // Falla: modal + latch
   const [faultOpen, setFaultOpen] = useState(false);
-  const [faultLatched, setFaultLatched] = useState(false); // << bloquea todos los controles hasta resetear
+  const [faultLatched, setFaultLatched] = useState(false);
   const [faultTitle, setFaultTitle] = useState<string>("");
   const [faultDesc, setFaultDesc] = useState<string>("");
-  const [shakeTick, setShakeTick] = useState(0); // reiniciar animación en cada nueva falla
+  const [shakeTick, setShakeTick] = useState(0);
 
-  function showFault(title: string, description: string) {
-    setFaultTitle(title);
-    setFaultDesc(description);
-    setFaultLatched(true);  // << activa latch
-    setFaultOpen(true);     // muestra modal
-    setShakeTick((t) => t + 1);
-    // En producción, aquí podrías disparar sonidos/luces, etc.
-  }
+  const prevModeRef = useRef<Mode>("ciclo");
+
+  useEffect(() => {
+    const prev = prevModeRef.current;
+
+    // 1) Si salimos de manual → dejar todo en OFF + (opcional) colector off
+    if (prev === "manual" && mode !== "manual") {
+      ["SERVOHOME","MOTORHOME","VACOFF","SYOFF"].forEach(c => sendCommand(c));
+      // Si quieres el seguro completo:
+      // sendCommand("colector off");
+    }
+
+    // 2) Publicar modo actual
+    if (mode === "manual") {
+      // Entrando a manual: forzar colector ON
+      sendCommand("modo manual");
+      sendCommand("colector on");
+    } else {
+      // Ciclo o etapa
+      sendCommand(`modo ${mode}`);
+    }
+
+    prevModeRef.current = mode;
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [mode]);
 
   // MOCK: dispara una falla cada ~20s
-  useEffect(() => {
-    const id = setInterval(() => {
-      const payload = { code: "E42", message: "Sobrevoltaje en HV supply" };
-      showFault(`Falla ${payload.code}`, payload.message);
-      setLogs((prev) => [`[FAULT] ${payload.code}: ${payload.message}`, ...prev].slice(0, 200));
-    }, 20000);
-    return () => clearInterval(id);
-  }, []);
+  // useEffect(() => {
+  //   const id = setInterval(() => {
+  //     const payload = { code: "E42", message: "Sobrevoltaje en HV supply" };
+  //     showFault(`Falla ${payload.code}`, payload.message);
+  //     setLogs((prev) => [`[FAULT] ${payload.code}: ${payload.message}`, ...prev].slice(0, 200));
+  //   }, 20000);
+  //   return () => clearInterval(id);
+  // }, []);
 
-  // Logs periódicos
-  useEffect(() => {
-    const id = setInterval(() => {
-      const now = new Date().toLocaleTimeString();
-      const line = isOn
-        ? `[${now}] Telemetría: OK · temp=22°C · hum=30%`
-        : `[${now}] Sistema en standby.`;
-      setLogs((prev) => [line, ...prev].slice(0, 200));
-    }, 3000);
-    return () => clearInterval(id);
-  }, [isOn]);
-
-  // Refresco de cámara (si hay falla, no refrescamos automáticamente)
+  // Refresco de cámara
   useEffect(() => {
     const id = setInterval(() => {
       if (!faultLatched) setCameraTick((t) => t + 1);
@@ -84,42 +90,73 @@ export default function VerificarPage() {
     return () => clearInterval(id);
   }, [faultLatched]);
 
-  // Envío de comandos (mock)
+  useEffect(() => {
+    const offAck = subscribeLogs(DEVICE_ID, (line) => {
+      setLogs(prev => [line, ...prev].slice(0, 200));
+    });
+    return () => offAck?.();
+  }, []);
+
+  useEffect(() => {
+  const off = subscribeFault(DEVICE_ID, (f) => {
+    if (!f) return; // llegó "{}" → no abrir popup ni cambiar nada
+    setFaultTitle(`Falla ${f.code ?? "FALLA"}`);
+    setFaultDesc(`Detalle: ${f.message ?? "Revisar el sistema"}${typeof f.etapa === "number" ? `\nEtapa: ${f.etapa}` : ""}`);
+    setFaultLatched(true);
+    setFaultOpen(true);
+    setShakeTick((t) => t + 1);
+    setLogs((prev) => [`[FAULT] ${f.code}: ${f.message}`, ...prev].slice(0, 200));
+  });
+  return () => off?.();
+}, []);
+
   const sendCommand = (cmd: string) => {
     if (!cmd.trim()) return;
     const now = new Date().toLocaleTimeString();
     setLogs((prev) => [`[${now}] → ${cmd}`, ...prev].slice(0, 200));
-    // TODO: publicar por MQTT el comando enviado
+    publishText(DEVICE_ID, cmd);
   };
 
-  // Botones globales
-  const togglePower = () => {
-    if (estopActive || faultLatched) return;
-    setIsOn((v) => !v);
-    sendCommand(!isOn ? "POWER ON" : "POWER OFF");
-  };
 
-  const toggleEstop = () => {
-    if (faultLatched) return; // << durante una falla, STOP/OK no opera
-    const next = !estopActive;
-    setEstopActive(next);
-    setIsOn(next ? false : isOn); // seguridad: al activar STOP apagamos
-    sendCommand(next ? "E-STOP ACTIVADO" : "E-STOP LIBERADO");
-  };
+// Power: NO se deshabilita por estop; la GUI decide.
+// Si hay estop, primero enviamos "ok" y luego "start".
+const togglePower = () => {
+  if (faultLatched) return;           // única condición que bloquea power
+  if (estopActive) {
+    sendCommand("ok");                // libera paro primero
+    setEstopActive(false);            // optimista
+  }
+  sendCommand("start");
+  setIsOn((v) => !v);                 // optimista: la GUI manda
+};
 
-  const handleReset = () => {
-    if (estopActive || faultLatched) return; // << bloqueado en falla o STOP
-    setLogs((prev) => ["Reset ejecutado.", ...prev].slice(0, 200));
-    // TODO: enviar comando reset por MQTT
-  };
+const toggleEstop = () => {
+  if (faultLatched) return;
+  if (estopActive) {
+    sendCommand("ok");
+    setEstopActive(false);            // ⬅️ NO toques isOn aquí
+  } else {
+    sendCommand("paro");
+    setEstopActive(true);             // ⬅️ NO hagas setIsOn(false)
+    // ⛔ QUITADO: setIsOn(false)
+  }
+};
 
-  // Nuevo: Reset de fallas (único botón activo durante la falla)
-  const handleFaultReset = () => {
-    setFaultOpen(false);     // cierra modal si estuviera abierto
-    setFaultLatched(false);  // libera latch => re-habilita controles
-    setLogs((prev) => ["Falla reseteada por operador.", ...prev].slice(0, 200));
-    // TODO: publicar por MQTT: ack/reset de fallas
-  };
+const handleReset = () => {
+  if (faultLatched) return;
+  setLogs((prev) => ["Reset ejecutado.", ...prev].slice(0, 200));
+  sendCommand("reset");
+  // (opcional) sin tocar isOn; la GUI sigue mandando
+};
+
+const handleFaultReset = () => {
+  setFaultOpen(false);
+  setFaultLatched(false);
+  setLogs((prev) => ["Falla reseteada por operador.", ...prev].slice(0, 200));
+  sendCommand("rfalla");
+};
+
+
 
   // Consola
   const inputRef = useRef<HTMLInputElement>(null);
@@ -130,7 +167,7 @@ export default function VerificarPage() {
   };
 
   // Deshabilitaciones comunes
-  const commonDisabled = estopActive || faultLatched || !isOn;
+  const commonDisabled = faultLatched || estopActive || !isOn;
   const glass = "border border-white/15 bg-white/10 backdrop-blur-lg";
   const card = `rounded-2xl ${glass} p-4 shadow-[0_8px_30px_rgba(0,0,0,0.12)]`;
   const titleClass = "text-sm font-medium text-white/90";
@@ -183,7 +220,7 @@ export default function VerificarPage() {
           <div className={card}>
             <div className="mb-3 flex items-center gap-2">
               <TerminalSquare className="h-5 w-5 text-white/80" />
-              <p className={titleClass}>Consola (MQTT mock)</p>
+              <p className={titleClass}>Consola (MQTT)</p>
             </div>
 
             <div className="mb-3 flex flex-wrap gap-2 text-xs">
@@ -215,21 +252,21 @@ export default function VerificarPage() {
               <input
                 ref={inputRef}
                 className="min-w-0 flex-1 rounded-xl border border-white/15 bg-white/10 px-3 py-2 text-white placeholder:text-white/50 focus:outline-none focus:ring-2 focus:ring-white/30"
-                placeholder="Escribe un comando (mock) y presiona Enviar"
+                placeholder="Escribe un comando y presiona Enviar"
                 value={inputLine}
                 onChange={(e) => setInputLine(e.target.value)}
                 onKeyDown={(e) => {
                   if (e.key === "Enter") onSubmitConsole();
                 }}
-                disabled={estopActive || faultLatched}
+                disabled={faultLatched}
               />
               <button
                 onClick={onSubmitConsole}
-                disabled={estopActive || faultLatched || !inputLine.trim()}
+                disabled={faultLatched || !inputLine.trim()}
                 className={[
                   "rounded-xl px-4 py-2 text-sm font-medium transition",
                   "border border-white/15 bg-white/10",
-                  estopActive || faultLatched || !inputLine.trim()
+                  faultLatched || !inputLine.trim()
                     ? "text-white/50"
                     : "text-white hover:bg-white/15",
                 ].join(" ")}
@@ -289,7 +326,7 @@ export default function VerificarPage() {
               <button
                 type="button"
                 onClick={togglePower}
-                disabled={estopActive || faultLatched}
+                disabled={faultLatched}
                 className={[
                   "rounded-xl px-4 py-3 text-sm font-semibold transition",
                   estopActive || faultLatched
@@ -323,7 +360,7 @@ export default function VerificarPage() {
                 {estopActive ? "OK" : "STOP"}
               </button>
 
-              {/* Reset normal (bloqueado en STOP o Falla) */}
+              {/* Reset normal */}
               <button
                 type="button"
                 onClick={handleReset}
@@ -342,7 +379,7 @@ export default function VerificarPage() {
                 </span>
               </button>
 
-              {/* Reset de fallas (único activo durante la falla) */}
+              {/* Reset de fallas */}
               <button
                 type="button"
                 onClick={handleFaultReset}
@@ -367,11 +404,11 @@ export default function VerificarPage() {
               {mode === "ciclo" && (
                 <button
                   type="button"
-                  onClick={() => sendCommand("SIGUIENTE CICLO")}
-                  disabled={commonDisabled}
+                  onClick={() => sendCommand("clc")}
+                  disabled={estopActive || faultLatched || !isOn}
                   className={[
                     "w-full rounded-xl px-4 py-3 text-sm font-semibold transition",
-                    commonDisabled
+                    estopActive || faultLatched || !isOn
                       ? "cursor-not-allowed opacity-50"
                       : "border border-white/15 bg-white/10 text-white hover:bg-white/15",
                   ].join(" ")}
@@ -383,11 +420,11 @@ export default function VerificarPage() {
               {mode === "etapa" && (
                 <button
                   type="button"
-                  onClick={() => sendCommand("SIGUIENTE ETAPA")}
-                  disabled={commonDisabled}
+                  onClick={() => sendCommand("se")}
+                  disabled={estopActive || faultLatched || !isOn}
                   className={[
                     "w-full rounded-xl px-4 py-3 text-sm font-semibold transition",
-                    commonDisabled
+                    estopActive || faultLatched || !isOn
                       ? "cursor-not-allowed opacity-50"
                       : "border border-white/15 bg-white/10 text-white hover:bg-white/15",
                   ].join(" ")}
@@ -398,32 +435,38 @@ export default function VerificarPage() {
 
               {mode === "manual" && (
                 <div className="grid grid-cols-1 gap-3">
-                  <ToggleRow
-                    label="Jeringa"
-                    disabled={commonDisabled}
-                    onToggle={(v) => sendCommand(`JERINGA ${v ? "ON" : "OFF"}`)}
-                  />
-                  <ToggleRow
-                    label="Variac"
-                    disabled={commonDisabled}
-                    onToggle={(v) => sendCommand(`VARIAC ${v ? "ON" : "OFF"}`)}
-                  />
-                  <ToggleRow
-                    label="Giro Colector"
-                    disabled={commonDisabled}
-                    onToggle={(v) => sendCommand(`GIRO COLECTOR ${v ? "ON" : "OFF"}`)}
-                  />
-                  <ToggleRow
-                    label="Actuador Lineal"
-                    disabled={commonDisabled}
-                    onToggle={(v) => sendCommand(`ACTUADOR LINEAL ${v ? "ON" : "OFF"}`)}
-                  />
+                  <ToggleRow label="Jeringa" disabled={commonDisabled}
+                    onToggle={(v) => sendCommand(v ? "SYON" : "SYOFF")} />
+
+                  <ToggleRow label="Alto Voltaje" disabled={commonDisabled}
+                    onToggle={(v) => sendCommand(v ? "MOTORMOVE" : "MOTORHOME")} />
+
+                  <ToggleRow label="Giro Colector" disabled={commonDisabled}
+                    onToggle={(v) => sendCommand(v ? "VACON" : "VACOFF")} />
+
+                  <ToggleRow label="Actuador Lineal" disabled={commonDisabled}
+                    onToggle={(v) => sendCommand(v ? "SERVOMOVE" : "SERVOHOME")} />
+
+
+                  {/* --- NUEVO: pruebas de comunicación --- */}
+                  <div className="mt-2 space-y-2 rounded-xl border border-white/10 bg-white/5 p-3">
+                    <CommTestRow
+                      label="Comunicación RS232"
+                      disabled={estopActive || faultLatched || !isOn}
+                      onTest={() => sendCommand("P232")}
+                    />
+                    <CommTestRow
+                      label="Comunicación RS485"
+                      disabled={estopActive || faultLatched || !isOn}
+                      onTest={() => sendCommand("P485")}
+                    />
+                  </div>
                 </div>
               )}
             </div>
           </div>
 
-          {/* Modal de Falla (shake + rojo) */}
+          {/* Modal de Falla */}
           <AlertDialog open={faultOpen} onOpenChange={setFaultOpen}>
             <AlertDialogContent
               className={[
@@ -444,7 +487,6 @@ export default function VerificarPage() {
                 </AlertDialogHeader>
 
                 <AlertDialogFooter>
-                  {/* Nota: OK solo cierra el modal visual, el latch sigue activo */}
                   <AlertDialogAction
                     onClick={() => setFaultOpen(false)}
                     className="rounded-xl border border-rose-400/40 bg-rose-700/20 px-4 py-2 text-rose-100 hover:bg-rose-700/30 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-rose-300/60"
@@ -517,6 +559,36 @@ function ToggleRow({
           Off
         </button>
       </div>
+    </div>
+  );
+}
+
+/** Fila de prueba de comunicación (RS232 / RS485) */
+function CommTestRow({
+  label,
+  disabled,
+  onTest,
+}: {
+  label: string;
+  disabled?: boolean;
+  onTest?: () => void;
+}) {
+  return (
+    <div className="flex items-center justify-between gap-3">
+      <span className="text-white/90">{label}</span>
+      <button
+        type="button"
+        onClick={onTest}
+        disabled={!!disabled}
+        className={[
+          "rounded-xl px-3 py-2 text-xs font-medium transition",
+          "border border-white/15 bg-white/10",
+          disabled ? "text-white/50 cursor-not-allowed" : "text-white hover:bg-white/15",
+        ].join(" ")}
+        title="Enviar comando de prueba"
+      >
+        Probar
+      </button>
     </div>
   );
 }

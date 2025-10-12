@@ -1,5 +1,6 @@
 "use client";
 
+import { publishText, DEVICE_ID, publishParams, subscribeParamsActive } from "@/lib/mqttClient";
 import { useEffect, useRef, useState } from "react";
 import Link from "next/link";
 import { useToast } from "@/hooks/use-toast"
@@ -55,6 +56,21 @@ export default function ParametrosPage() {
 
   const dialogRef = useRef<HTMLDivElement>(null);
 
+  useEffect(() => {
+    const unsub = subscribeParamsActive(DEVICE_ID, (p) => {
+      // Aquí podrías comparar y marcar flags como “enviados”
+      // o simplemente avisar:
+      toast({
+        title: "Parámetros aplicados en el equipo",
+        description: JSON.stringify(p),
+        className: "border-emerald-400/50 bg-emerald-500/15",
+      });
+    });
+    return () => unsub?.();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+
   function showError(title: string, description: string) {
     setErrorTitle(title);
     setErrorDesc(description);
@@ -104,53 +120,49 @@ export default function ParametrosPage() {
     const v = parseAndValidate(mlmin, "Jeringa/Bomba (ml/min)");
     if (v === null) return;
     setMlminSent(true);
-    toast({ title: "Caudal enviado", description: `${v} ml/min`, className: "border-emerald-400/50 bg-emerald-500/15", });
-    // TODO: MQTT con v
+    toast({ title: "Caudal enviado", description: `${v} ml/min`, className: "border-emerald-400/50 bg-emerald-500/15" });
+    publishParams(DEVICE_ID, { mlmin: v }, false);
   };
 
   const sendKv = () => {
     const v = parseAndValidate(kv, "Fuente de alto Voltaje (kV)");
     if (v === null) return;
     setKvSent(true);
-    toast({ title: "Voltaje enviado", description: `${v} kV`,className: "border-emerald-400/50 bg-emerald-500/15", });
+    toast({ title: "Voltaje enviado", description: `${v} kV`, className: "border-emerald-400/50 bg-emerald-500/15" });
+    publishParams(DEVICE_ID, { kv: v }, false);
   };
 
   const sendSyringeD = () => {
     const v = parseAndValidate(syringeD, "Diámetro jeringa (mm)");
     if (v === null) return;
     setSyringeDSent(true);
-    toast({ title: "Diámetro enviado", description: `${v} mm`, className: "border-emerald-400/50 bg-emerald-500/15", });
+    toast({ title: "Diámetro enviado", description: `${v} mm`, className: "border-emerald-400/50 bg-emerald-500/15" });
+    publishParams(DEVICE_ID, { syringeD: v }, false);
   };
 
   const sendGap = () => {
     const v = parseAndValidate(gap, "Distancia (mm)");
     if (v === null) return;
     setGapSent(true);
-    toast({ title: "Distancia enviada", description: `${v} mm`, className: "border-emerald-400/50 bg-emerald-500/15", });
+    toast({ title: "Distancia enviada", description: `${v} mm`, className: "border-emerald-400/50 bg-emerald-500/15" });
+    publishParams(DEVICE_ID, { gap: v }, false);
   };
 
   const sendVariac = () => {
-    // Colector se envía/valida en conjunto con RPM
     if (!collectorOn) {
       setVariacSent(false);
-      setCollectorError(true); // resalta selector
-      toast({
-        variant: "destructive",
-        title: "Colector desactivado",
-        description: "Activa el colector (Sí) para usar RPM.",
-      });
+      setCollectorError(true);
+      toast({ variant: "destructive", title: "Colector desactivado", description: "Activa el colector (Sí) para usar RPM." });
       return;
     }
     const v = parseAndValidate(rpm, "Variador trifásico (rpm)");
-    if (v === null) {
-      setVariacSent(false);
-      return;
-    }
+    if (v === null) { setVariacSent(false); return; }
     setCollectorError(false);
     setVariacSent(true);
-    toast({ title: "RPM enviadas", description: `${v} rpm (colector: Sí)`, className: "border-emerald-400/50 bg-emerald-500/15", });
-    // TODO: MQTT con { collectorOn: true, rpm: v }
+    toast({ title: "RPM enviadas", description: `${v} rpm (colector: Sí)`, className: "border-emerald-400/50 bg-emerald-500/15" });
+    publishParams(DEVICE_ID, { collectorOn: true, rpm: v }, false);
   };
+
 
   // ---- Enviar todo ----
   const sendAll = () => {
@@ -192,11 +204,28 @@ export default function ParametrosPage() {
       return;
     }
 
+    // ...
     toast({
       title: "Todos enviados",
-      description: `Colector: ${collectorOn ? "Sí" : "No"}${collectorOn ? `` : ""}`,
-      className: "border-emerald-400/50 bg-emerald-500/15"});
-    // TODO: MQTT en lote con { collectorOn, kv, mlmin, syringeD, gap, rpm? }
+      description: `Colector: ${collectorOn ? "Sí" : "No"}`,
+      className: "border-emerald-400/50 bg-emerald-500/15",
+    });
+
+    // Construye el payload final con números reales:
+    const payload: any = {
+      collectorOn,
+      kv: Number(String(kv).trim().replace(",", ".")),
+      mlmin: Number(String(mlmin).trim().replace(",", ".")),
+      syringeD: Number(String(syringeD).trim().replace(",", ".")),
+      gap: Number(String(gap).trim().replace(",", ".")),
+    };
+    if (collectorOn) {
+      payload.rpm = Number(String(rpm).trim().replace(",", "."));
+    }
+
+    // Publica con apply=true (para que el ESP32 los aplique/guarde en NVS)
+    publishParams(DEVICE_ID, payload, true);
+
   };
 
   // ---- Edit handlers (reset “enviado”) ----
@@ -211,7 +240,10 @@ export default function ParametrosPage() {
     setCollectorOn(v);
     setCollectorError(false);
     setVariacSent(false);
+    // MQTT v0: solo colector on/off
+    publishText(DEVICE_ID, v ? "colector on" : "colector off");
   };
+
 
   // Presets
   const applyPreset = () => {
