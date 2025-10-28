@@ -1,11 +1,53 @@
-# ===== Tareas del sistema / red =====
+# ===== Tareas del sistema / red (las que ya tenías) =====
 CONFIG_ESP_EVENT_LOOP_TASK_STACK_SIZE=4096
 CONFIG_LWIP_TCPIP_TASK_STACK_SIZE=4096
 CONFIG_ESP_TIMER_TASK_STACK_SIZE=4096
 CONFIG_ESP_MAIN_TASK_STACK_SIZE=8192
 
-# ===== MQTT =====
+# ===== MQTT (la que ya tenías) =====
 CONFIG_MQTT_TASK_STACK_SIZE=6144
 
-# (opcional) menos ruido de logs por defecto
+# ===== Logs por defecto (la que ya tenías) =====
 CONFIG_LOG_DEFAULT_LEVEL_WARN=y
+
+# ===== TLS / mbedTLS: usar bundle de certificados =====
+CONFIG_MBEDTLS_CERTIFICATE_BUNDLE=y
+CONFIG_MBEDTLS_CERTIFICATE_BUNDLE_DEFAULT_FULL=y
+# Asegúrate de NO saltarte la verificación del servidor:
+# CONFIG_ESP_TLS_SKIP_SERVER_CERT_VERIFY is not set
+
+# (Opcional) buffers algo mayores para TLS si usas muchos topics/payloads
+CONFIG_MBEDTLS_SSL_OUT_CONTENT_LEN=4096
+CONFIG_MBEDTLS_SSL_IN_CONTENT_LEN=4096
+
+# (Opcional) SNTP para hora correcta (evita problemas de validez de certificados)
+CONFIG_SNTP_TIME_SYNC_METHOD_IMMED=y
+CONFIG_SNTP_MAX_SERVERS=1
+# CONFIG_SNTP_TIME_SYNC_METHOD_SMOOTH is not set
+
+# ===== Flash size (2MB) =====
+CONFIG_ESPTOOLPY_FLASHSIZE_2MB=y
+# CONFIG_ESPTOOLPY_FLASHSIZE_4MB is not set
+
+# (Opcional, redundante con board_build.partitions, pero explícito)
+CONFIG_PARTITION_TABLE_CUSTOM=y
+CONFIG_PARTITION_TABLE_FILENAME="partitions_2mb_noota.csv"
+
+# Wi-Fi: sin ahorro de energía
+CONFIG_ESP_WIFI_STATIC_RX_BUFFER_NUM=10
+CONFIG_ESP_WIFI_DYNAMIC_TX_BUFFER=y
+CONFIG_ESP_WIFI_TX_BUFFER_TYPE=1
+CONFIG_ESP_WIFI_STA_DISCONNECTED_PM_ENABLE=n
+
+# MQTT: outbox/buffers/cola
+CONFIG_MQTT_TRANSPORT_SSL=y
+CONFIG_MQTT_PROTOCOL_311=y
+CONFIG_MQTT_BUFFER_SIZE=2048
+CONFIG_MQTT_OUTBOX_SIZE=4096
+
+# LWIP: keepalive por defecto razonable (por si tu IDF no soporta el anidado)
+CONFIG_LWIP_TCP_KEEPALIVE=y
+CONFIG_LWIP_TCP_MAXRTX=12
+CONFIG_LWIP_TCP_SYNMAXRTX=12
+
+

@@ -39,6 +39,10 @@ bool Syringe_SetDirection(const char *dir);
 bool Syringe_QueryDirection(char *out_dir, int maxlen);
 bool Syringe_QueryDispensed(float *out_infuse, float *out_withdraw, char *out_units, int units_len);
 bool Syringe_ClearDispensed(const char *which);
+// Test de conexión: sale de Safe Mode y lee VER.
+// Devuelve true si obtiene firmware. Llena out_fw (normalizado) y out_diag (logs separados por ';').
+bool Syringe_TestVER(char *out_fw, int fw_len, char *out_diag, int diag_len, int timeout_ms);
+
 
 // Puedes añadir aquí más funciones específicas según las vayas implementando
 // Ej: bool Syringe_SetVolume(...);
