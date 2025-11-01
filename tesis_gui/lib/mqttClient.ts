@@ -8,6 +8,10 @@ let client: MqttClient | null = null;
 export const DEVICE_ID =
   process.env.NEXT_PUBLIC_DEVICE_ID?.trim() || "esp32-demo";
 
+export const CAM_DEVICE_ID =
+  process.env.NEXT_PUBLIC_CAM_DEVICE_ID?.trim() || "esp32cam";
+
+
   // ===== Fallas (popup) =====
 export type FaultPayload = Partial<{
   code: string;     // p.ej. "SENSOR_TIMEOUT", "MAN_TIMEOUT", etc.
@@ -197,6 +201,33 @@ export function publishParams(deviceId: string, patch: ParamsPatch, apply = fals
   c.publish(topic, payload, { qos: 1, retain: false });
 }
 
+export function subscribeCamFrame(
+  deviceId: string = CAM_DEVICE_ID,
+  cb: (dataUrl: string) => void
+) {
+  const c = getClient();
+  const topic = `cams/${deviceId}/frame_b64`;
+
+  const handler = (t: string, payload: Uint8Array) => {
+    if (t !== topic) return;
+    // El ESP publica "data:image/jpeg;base64,...."
+    // Si algún día publicas sólo base64, aquí le antepones el prefijo.
+    const txt = new TextDecoder().decode(payload);
+    cb(txt);
+  };
+
+  c.subscribe(topic, { qos: 0 });
+  c.on("message", handler);
+
+  return () => {
+    try {
+      c.off("message", handler as any);
+      c.unsubscribe(topic);
+    } catch {}
+  };
+}
+
+
 export function subscribeParamsActive(
   deviceId: string,
   onParams: (p: any) => void
@@ -215,6 +246,9 @@ export function subscribeParamsActive(
       c.unsubscribe(topic);
     } catch {}
   };
+  
 }
+
+
 
 

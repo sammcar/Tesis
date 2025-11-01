@@ -89,8 +89,10 @@ float ServoSG90_MmToDeg(const ServoSG90_Handle_t* s, float mm){
     float m = mm;
     if (m < 0) m = 0;
     if (s->stroke_mm_max > 0 && m > s->stroke_mm_max) m = s->stroke_mm_max;
+
     float deg_per_mm = 360.0f / (s->mm_per_rev > 0 ? s->mm_per_rev : 52.5f);
-    return s->zero_deg + m * deg_per_mm;
+    float sign = s->invert_dir ? -1.0f : +1.0f;
+    return s->zero_deg + sign * (m * deg_per_mm);
 }
 
 float ServoSG90_DegToMm(const ServoSG90_Handle_t* s, float deg){

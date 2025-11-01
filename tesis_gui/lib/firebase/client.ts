@@ -1,6 +1,9 @@
 import { getApps, initializeApp } from "firebase/app";
 import { getAuth, GithubAuthProvider } from "firebase/auth";
 
+export const runtime = 'nodejs';
+
+
 const firebaseConfig = {
   apiKey: process.env.NEXT_PUBLIC_FIREBASE_API_KEY!,
   authDomain: process.env.NEXT_PUBLIC_FIREBASE_AUTH_DOMAIN!,

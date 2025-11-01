@@ -1,7 +1,8 @@
 // app/(dashboard)/verificar/page.tsx
 "use client";
 
-import { subscribeLogs, publishText, subscribeState, subscribeFault, DEVICE_ID } from "@/lib/mqttClient";
+import { subscribeLogs, publishText, subscribeState, subscribeFault, subscribeCamFrame, DEVICE_ID } from "@/lib/mqttClient";
+import {CAM_DEVICE_ID} from "@/lib/mqttClient";
 import { useEffect, useMemo, useRef, useState } from "react";
 import Link from "next/link";
 import { ArrowLeft, Power, RefreshCcw, Camera, TerminalSquare } from "lucide-react";
@@ -31,7 +32,9 @@ export default function VerificarPage() {
   ]);
   const [inputLine, setInputLine] = useState<string>("");
 
-  // Cámara mock (refresco)
+  // Cámara (mock + MQTT base64)
+  const [frameUrl, setFrameUrl] = useState<string | null>(null);
+  const [camMqttOk, setCamMqttOk] = useState<boolean>(false);
   const [cameraTick, setCameraTick] = useState<number>(0);
   const cameraRefreshMs = 3000;
   const cameraUrl = useMemo(
@@ -54,8 +57,6 @@ export default function VerificarPage() {
     // 1) Si salimos de manual → dejar todo en OFF + (opcional) colector off
     if (prev === "manual" && mode !== "manual") {
       ["SERVOHOME","MOTORHOME","VACOFF","SYOFF"].forEach(c => sendCommand(c));
-      // Si quieres el seguro completo:
-      // sendCommand("colector off");
     }
 
     // 2) Publicar modo actual
@@ -72,24 +73,30 @@ export default function VerificarPage() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [mode]);
 
-  // MOCK: dispara una falla cada ~20s
-  // useEffect(() => {
-  //   const id = setInterval(() => {
-  //     const payload = { code: "E42", message: "Sobrevoltaje en HV supply" };
-  //     showFault(`Falla ${payload.code}`, payload.message);
-  //     setLogs((prev) => [`[FAULT] ${payload.code}: ${payload.message}`, ...prev].slice(0, 200));
-  //   }, 20000);
-  //   return () => clearInterval(id);
-  // }, []);
-
-  // Refresco de cámara
+  // === MQTT: frames de cámara (base64) ===
   useEffect(() => {
+    const off = subscribeCamFrame(CAM_DEVICE_ID, (dataUrl) => {
+      if (typeof dataUrl === "string" && dataUrl.startsWith("data:image/")) {
+        setFrameUrl(dataUrl);
+        setCamMqttOk(true);
+      }
+    });
+    // Marca “esperando” si no llegó nada en 5s
+    const t = setTimeout(() => { if (!frameUrl) setCamMqttOk(false); }, 5000);
+    return () => { off?.(); clearTimeout(t); };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  // Refresco de mock si no hay frames reales
+  useEffect(() => {
+    if (frameUrl) return; // si ya hay frames reales, no refresques el mock
     const id = setInterval(() => {
       if (!faultLatched) setCameraTick((t) => t + 1);
     }, cameraRefreshMs);
     return () => clearInterval(id);
-  }, [faultLatched]);
+  }, [faultLatched, cameraRefreshMs, frameUrl]);
 
+  // Logs por MQTT
   useEffect(() => {
     const offAck = subscribeLogs(DEVICE_ID, (line) => {
       setLogs(prev => [line, ...prev].slice(0, 200));
@@ -97,18 +104,19 @@ export default function VerificarPage() {
     return () => offAck?.();
   }, []);
 
+  // Faults por MQTT
   useEffect(() => {
-  const off = subscribeFault(DEVICE_ID, (f) => {
-    if (!f) return; // llegó "{}" → no abrir popup ni cambiar nada
-    setFaultTitle(`Falla ${f.code ?? "FALLA"}`);
-    setFaultDesc(`Detalle: ${f.message ?? "Revisar el sistema"}${typeof f.etapa === "number" ? `\nEtapa: ${f.etapa}` : ""}`);
-    setFaultLatched(true);
-    setFaultOpen(true);
-    setShakeTick((t) => t + 1);
-    setLogs((prev) => [`[FAULT] ${f.code}: ${f.message}`, ...prev].slice(0, 200));
-  });
-  return () => off?.();
-}, []);
+    const off = subscribeFault(DEVICE_ID, (f) => {
+      if (!f) return; // llegó "{}" → no abrir popup ni cambiar nada
+      setFaultTitle(`Falla ${f.code ?? "FALLA"}`);
+      setFaultDesc(`Detalle: ${f.message ?? "Revisar el sistema"}${typeof f.etapa === "number" ? `\nEtapa: ${f.etapa}` : ""}`);
+      setFaultLatched(true);
+      setFaultOpen(true);
+      setShakeTick((t) => t + 1);
+      setLogs((prev) => [`[FAULT] ${f.code}: ${f.message}`, ...prev].slice(0, 200));
+    });
+    return () => off?.();
+  }, []);
 
   const sendCommand = (cmd: string) => {
     if (!cmd.trim()) return;
@@ -117,46 +125,40 @@ export default function VerificarPage() {
     publishText(DEVICE_ID, cmd);
   };
 
+  // Power: NO se deshabilita por estop; la GUI decide.
+  const togglePower = () => {
+    if (faultLatched) return;           // única condición que bloquea power
+    if (estopActive) {
+      sendCommand("ok");                // libera paro primero
+      setEstopActive(false);            // optimista
+    }
+    sendCommand("start");
+    setIsOn((v) => !v);                 // optimista: la GUI manda
+  };
 
-// Power: NO se deshabilita por estop; la GUI decide.
-// Si hay estop, primero enviamos "ok" y luego "start".
-const togglePower = () => {
-  if (faultLatched) return;           // única condición que bloquea power
-  if (estopActive) {
-    sendCommand("ok");                // libera paro primero
-    setEstopActive(false);            // optimista
-  }
-  sendCommand("start");
-  setIsOn((v) => !v);                 // optimista: la GUI manda
-};
+  const toggleEstop = () => {
+    if (faultLatched) return;
+    if (estopActive) {
+      sendCommand("ok");
+      setEstopActive(false);            // ⬅️ NO toques isOn aquí
+    } else {
+      sendCommand("paro");
+      setEstopActive(true);             // ⬅️ NO hagas setIsOn(false)
+    }
+  };
 
-const toggleEstop = () => {
-  if (faultLatched) return;
-  if (estopActive) {
-    sendCommand("ok");
-    setEstopActive(false);            // ⬅️ NO toques isOn aquí
-  } else {
-    sendCommand("paro");
-    setEstopActive(true);             // ⬅️ NO hagas setIsOn(false)
-    // ⛔ QUITADO: setIsOn(false)
-  }
-};
+  const handleReset = () => {
+    if (faultLatched) return;
+    setLogs((prev) => ["Reset ejecutado.", ...prev].slice(0, 200));
+    sendCommand("reset");
+  };
 
-const handleReset = () => {
-  if (faultLatched) return;
-  setLogs((prev) => ["Reset ejecutado.", ...prev].slice(0, 200));
-  sendCommand("reset");
-  // (opcional) sin tocar isOn; la GUI sigue mandando
-};
-
-const handleFaultReset = () => {
-  setFaultOpen(false);
-  setFaultLatched(false);
-  setLogs((prev) => ["Falla reseteada por operador.", ...prev].slice(0, 200));
-  sendCommand("rfalla");
-};
-
-
+  const handleFaultReset = () => {
+    setFaultOpen(false);
+    setFaultLatched(false);
+    setLogs((prev) => ["Falla reseteada por operador.", ...prev].slice(0, 200));
+    sendCommand("rfalla");
+  };
 
   // Consola
   const inputRef = useRef<HTMLInputElement>(null);
@@ -290,7 +292,19 @@ const handleFaultReset = () => {
             <div className="mb-3 flex items-center justify-between">
               <div className="flex items-center gap-2">
                 <Camera className="h-5 w-5 text-white/80" />
-                <p className={titleClass}>Cámara (ESP32-CAM · mock)</p>
+                <p className={titleClass}>Cámara (ESP32-CAM)</p>
+                {/* Badge MQTT cam */}
+                <span
+                  className={[
+                    "ml-2 rounded-lg border px-2 py-0.5 text-[11px]",
+                    camMqttOk
+                      ? "border-emerald-400/40 bg-emerald-500/20 text-emerald-200"
+                      : "border-yellow-400/40 bg-yellow-600/20 text-yellow-100",
+                  ].join(" ")}
+                  title={camMqttOk ? "Recibiendo frames por MQTT" : "Esperando frames por MQTT"}
+                >
+                  {camMqttOk ? "MQTT cam: activo" : "MQTT cam: esperando…"}
+                </span>
               </div>
               <button
                 type="button"
@@ -305,13 +319,13 @@ const handleFaultReset = () => {
             </div>
             <div className="overflow-hidden rounded-xl border border-white/10 bg-black/40">
               <img
-                src={cameraUrl}
-                alt="Snapshot cámara (mock)"
+                src={frameUrl ?? cameraUrl} // MQTT dataURL o mock
+                alt="Stream cámara (ESP32-CAM)"
                 className="h-auto w-full object-cover"
               />
             </div>
             <p className="mt-2 text-xs text-white/70">
-              Snapshot mock cada ~{cameraRefreshMs / 1000}s.
+              {frameUrl ? "Frames vía MQTT (base64)." : `Snapshot mock cada ~${cameraRefreshMs / 1000}s.`}
             </p>
           </div>
         </div>
@@ -447,8 +461,6 @@ const handleFaultReset = () => {
                   <ToggleRow label="Actuador Lineal" disabled={commonDisabled}
                     onToggle={(v) => sendCommand(v ? "SERVOMOVE" : "SERVOHOME")} />
 
-
-                  {/* --- NUEVO: pruebas de comunicación --- */}
                   <div className="mt-2 space-y-2 rounded-xl border border-white/10 bg-white/5 p-3">
                     <CommTestRow
                       label="Comunicación RS232"
@@ -519,7 +531,7 @@ function ToggleRow({
   const click = (next: boolean) => {
     if (disabled) return;
     setOn(next);
-    onToggle?.(next); // TODO: publicar por MQTT el cambio
+    onToggle?.(next);
   };
 
   return (

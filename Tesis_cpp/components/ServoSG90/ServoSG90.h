@@ -15,6 +15,7 @@ typedef struct {
     uint32_t          freq_hz;
     uint16_t          us_min, us_max;
     uint16_t          deg_min, deg_max;
+    bool invert_dir; // false por defecto
     bool              inited;
 
     // --- NUEVO: mapeo lineal y calibración ---
