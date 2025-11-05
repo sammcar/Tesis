@@ -99,6 +99,14 @@
 #define OPENLOOP_HOLD_MS   SPD_HOLD_MS    // usa el mismo hold que en control cerrado
 #endif
 
+#ifndef CAL_M
+#define CAL_M   1.0f     // pendiente (ajústala con tu par de puntos)
+#endif
+
+#ifndef CAL_B
+#define CAL_B   0.0f     // offset (ajústalo)
+#endif
+
 
 
 // STRUCTS
@@ -106,7 +114,7 @@
     .i2c_num    = I2C_NUM_0,
     .pin_sda    = GPIO_NUM_21,
     .pin_scl    = GPIO_NUM_22,
-    .i2c_clk_hz = 100000,
+    .i2c_clk_hz = 25000,
     .pin_xshut  = GPIO_NUM_NC  // XSHUT ya a 3V3 en HW
   };
   
@@ -165,6 +173,7 @@ typedef struct {
 static volatile bool   g_pid_enabled = false;
 static volatile float  g_target_deg  = 0.0f;
 static volatile bool g_motor_moving = false;
+bool rok = false;
 char smsg[96];
 char lmsg[96];
 char m1[96];
@@ -193,7 +202,6 @@ const float SLOPE_0_90   = (GAP_90_DEG_MM  - GAP_0_DEG_MM)   / 90.0f; // ≈ 0.1
 const float SLOPE_90_180 = (GAP_180_DEG_MM - GAP_90_DEG_MM)  / 90.0f; // ≈ 0.1444 mm/deg
 float target_gap_mm = 140.0f;
 const float LOOP_HZ        = 20.0f;
-const TickType_t LOOP_TICK = pdMS_TO_TICKS((int)(1000.0f/LOOP_HZ));
 const float DEADBAND_MM    = 2.0f;    // no mover si |error| ≤ deadband
 const float STEP_DEG_MAX   = 2.0f;    // límite de cambio por ciclo (suaviza)
 float servo_deg_cmd        = 90.0f;   // arranca al centro
@@ -211,8 +219,14 @@ static volatile bool mover_servo_task = false;
 static volatile float g_sensor_mm_raw  = NAN;   // lectura cruda del VL53L0X
 static volatile float g_gap_mm_filt    = NAN;   // gap filtrado (mm)
 static volatile float g_servo_deg_last = NAN;   // último ángulo comandado
-static volatile float g_last_gap_mm = NAN;
 static volatile bool g_spd_reached = false;
+char rmsg[64];
+float sensor_mm;
+float gap_mm;
+// === GLOBAL (una sola vez, p.ej. arriba de tus archivos) ===
+volatile float g_last_gap_mm = 0.0f;
+volatile bool  g_last_gap_from_sensor = false;   // 1=sensor real, 0=estimado
+SemaphoreHandle_t g_last_gap_mutex;
 
 
 // VARIABLES VERDES
@@ -230,6 +244,8 @@ static time_t sensor_armed_since[NUM_SENSORES] = {0};
 static esp_mqtt_client_handle_t mqtt = NULL;
 static gap_shared_t g_gap = { NAN, NAN, NAN, 0, false };
 static SemaphoreHandle_t g_gap_mutex = NULL;
+uint16_t mm = 0;
+const TickType_t LOOP_TICK = pdMS_TO_TICKS((int)(1000.0f/LOOP_HZ));
 
 // PROTOTIPOS
 
@@ -250,6 +266,10 @@ static void verificar_fallos(void);
 static void liberar_latches_si_corresponde(void);
 static void publish_sensor_float(const char* name, float value);
 static bool sensor_mock_timed_hold_generic(int s_idx, int hold_s);
+static inline float angle_to_gap_mm(float deg);
+static inline float laser_mm_to_gap_mm(float sensor_mm);
+static inline void set_last_gap(float mm, bool from_sensor);
+bool probe_laser(uint16_t *out_raw_mm, float *out_gap_mm);
 
 // CONSTANTES GRAFCET
 
@@ -477,6 +497,117 @@ void needle_set_target_mm(float mm){
   log_line("[needle] new target=%.1f mm", tgt);
 }
 
+static inline void set_last_gap(float mm, bool from_sensor) {
+  if (xSemaphoreTake(g_last_gap_mutex, pdMS_TO_TICKS(5)) == pdTRUE) {
+    g_last_gap_mm = mm;
+    g_last_gap_from_sensor = from_sensor;
+    xSemaphoreGive(g_last_gap_mutex);
+  }
+}
+
+static void refresh_last_gap_best_effort(float expected_gap_mm) {
+  // Intentar lectura real; si falla, usar el esperado
+  uint16_t mm = 0; char rmsg[48];
+  bool ok = VL53L0X_ReadDistanceMM(&laser, &mm, rmsg, sizeof(rmsg));
+  if (ok) {
+    float sensor_mm = (float)mm;
+    float gap_real  = laser_mm_to_gap_mm(sensor_mm);
+    set_last_gap(gap_real, true);
+  } else {
+    set_last_gap(expected_gap_mm, false);
+  }
+}
+
+static inline float angle_to_gap_mm(float deg)
+{
+  if (deg <= 0.0f)   return clampf(GAP_0_DEG_MM,   NEEDLE_MIN_MM, NEEDLE_MAX_MM);
+  if (deg <= 90.0f)  return clampf(GAP_0_DEG_MM + deg * SLOPE_0_90, NEEDLE_MIN_MM, NEEDLE_MAX_MM);
+  if (deg <= 180.0f) return clampf(GAP_90_DEG_MM + (deg - 90.0f) * SLOPE_90_180, NEEDLE_MIN_MM, NEEDLE_MAX_MM);
+  return clampf(GAP_180_DEG_MM, NEEDLE_MIN_MM, NEEDLE_MAX_MM);
+}
+
+
+static inline float laser_mm_to_gap_mm(float sensor_mm)
+{
+  float gap = CAL_M * sensor_mm + CAL_B;
+  return clampf(gap, NEEDLE_MIN_MM, NEEDLE_MAX_MM);
+}
+
+bool probe_laser(uint16_t *out_raw_mm, float *out_gap_mm) {
+  uint16_t raw = 0;
+  char rmsg[48];
+
+  bool ok = VL53L0X_ReadDistanceMM(&laser, &raw, rmsg, sizeof(rmsg));
+  if (!ok) {
+    // No tocar g_last_gap_mm si no hubo lectura válida
+    return false;
+  }
+
+  float sensor_mm = (float)raw;
+  float gap_real  = laser_mm_to_gap_mm(sensor_mm);
+
+  // Actualiza “verdad única” indicando que viene de sensor real
+  set_last_gap(gap_real, true);
+
+  if (out_raw_mm) *out_raw_mm = raw;
+  if (out_gap_mm) *out_gap_mm = gap_real;
+  return true;
+}
+
+void pruebas_laser(void){
+    uint16_t mm;
+    float gap;
+    if (probe_laser(&mm, &gap)) {
+      printf("[probe] ok dist=%u mm → gap=%.1f mm\n", (unsigned)mm, gap);
+    } else {
+      printf("[probe] sin lectura\n");
+    }
+}
+
+void initLaser(void){
+
+    // --- MUTEX de "verdad única" (publicación continua)
+  g_last_gap_mutex = xSemaphoreCreateMutex();
+  if (!g_last_gap_mutex) { printf("❌ no g_last_gap_mutex\n"); while(1) vTaskDelay(pdMS_TO_TICKS(1000)); }
+
+  // --- MUTEX del buffer compartido de GAP (usado por needle_task / telemetry)
+  g_gap_mutex = xSemaphoreCreateMutex();
+  if (!g_gap_mutex) { printf("❌ no g_gap_mutex\n"); while(1) vTaskDelay(pdMS_TO_TICKS(1000)); }
+
+  // Inicializa estado del buffer GAP (evita leer basura)
+  if (xSemaphoreTake(g_gap_mutex, pdMS_TO_TICKS(5)) == pdTRUE) {
+    g_gap.sensor_mm = NAN;
+    g_gap.gap_mm    = NAN;
+    g_gap.gap_filt  = NAN;
+    g_gap.last_us   = 0;
+    g_gap.valid     = false;
+    xSemaphoreGive(g_gap_mutex);
+  }
+
+  // Inicializa la “verdad única” (por ejemplo, home)
+
+  set_last_gap(angle_to_gap_mm(180.0f), false);
+  bool lok = VL53L0X_Init(&laser, lmsg, sizeof(lmsg));
+  printf("Laser Init: %s (ok=%d)\n", lmsg, lok);
+  if (!lok) { printf("⚠️  Verifica VCC/GND/SDA/SCL/XSHUT.\n"); while(1) vTaskDelay(pdMS_TO_TICKS(1000)); }
+  pruebas_laser();
+}
+
+void initServo(void){
+  if (!ServoSG90_Init(&servo, smsg, sizeof(smsg))) {
+    printf("❌ Servo Init: %s\n", smsg);
+    while (1) vTaskDelay(pdMS_TO_TICKS(1000));
+  }
+  printf("Servo Init: %s\n", smsg);
+  (void)ServoSG90_SetAngleDeg(&servo, 90.0f, smsg, sizeof(smsg));
+}
+
+void initStepper(void){
+  Potenciometro_init();
+  stepper_init(&g_motor, STEP_PIN, DIR_PIN, EN_PIN, 10*1000000);
+  stepper_enable(&g_motor, true);
+}
+
 
 // TASKS
 
@@ -555,62 +686,22 @@ static void net_task(void *arg){
 }
 
 static void telemetry_task(void *arg) {
-  const int period_ms = 200;   // como tu fragmento de ejemplo
-
-  // Acumuladores de logs (para no spamear)
-  int acc_ms_laser = 0;
-  int acc_ms_pot   = 0;
+  const int period_ms = 200;    // publica 5 Hz (ajusta a gusto)
+  int acc_ms_pot = 0;           // logs pot solo si hay movimiento del stepper
 
   for (;;) {
-    // ====== LÁSER: lectura directa ======
-    uint16_t mm = 0;
-    char rmsg[64];
-    bool rok = VL53L0X_ReadDistanceMM(&laser, &mm, rmsg, sizeof(rmsg));
-
-    if (rok) {
-      float sensor_mm = (float)mm;
-      float gap_mm    = sensor_mm - LASER_TO_TIP_OFFSET_MM;
-
-      // Actualiza buffer compartido como VÁLIDO y fresco
-      int64_t now_us = esp_timer_get_time();
-      if (xSemaphoreTake(g_gap_mutex, pdMS_TO_TICKS(5)) == pdTRUE) {
-        g_gap.sensor_mm = sensor_mm;
-        g_gap.gap_mm    = gap_mm;
-        g_gap.gap_filt  = gap_mm;     // sin filtros: usa el mismo valor
-        g_gap.last_us   = now_us;
-        g_gap.valid     = true;
-        xSemaphoreGive(g_gap_mutex);
-      }
-
-      // MQTT: publica SOLO valores REALES + flags
-      //publish_sensor_float("laser_ok", 1.0f);
-      //publish_sensor_float("gap_valid", 1.0f);
-      publish_sensor_float("laser_mm", gap_mm);
-      //publish_sensor_float("gap_mm",   gap_mm);
-
-      // LOG del láser SOLO si el SERVO se está moviendo
-      if (g_needle_moving) {
-        acc_ms_laser += period_ms;
-        if (acc_ms_laser >= 1000) {
-          acc_ms_laser = 0;
-          log_line("[laser] gap=%.1f mm | sensor=%.1f mm", gap_mm, sensor_mm);
-        }
-      } else {
-        acc_ms_laser = 0;
-      }
-
-    } else {
-      // Marca buffer como INVÁLIDO (sin tocar valores)
-      if (xSemaphoreTake(g_gap_mutex, pdMS_TO_TICKS(5)) == pdTRUE) {
-        g_gap.valid = false;
-        xSemaphoreGive(g_gap_mutex);
-      }
-      // Sin logs de láser aquí (a menos que quieras uno condicional):
-      // if (g_needle_moving) log_line("[laser] sin muestra: %s", rmsg);
-      acc_ms_laser = 0;
+    // ===== “Verdad única” del gap (sin leer láser aquí) =====
+    float gap_to_pub = 0.0f; bool from_sensor = false;
+    if (xSemaphoreTake(g_last_gap_mutex, pdMS_TO_TICKS(5)) == pdTRUE) {
+      gap_to_pub  = g_last_gap_mm;
+      from_sensor = g_last_gap_from_sensor;
+      xSemaphoreGive(g_last_gap_mutex);
     }
 
-    // ====== POTENCIÓMETRO / KV: SIEMPRE MQTT, logs solo con stepper en movimiento ======
+    publish_sensor_float("laser_mm",     gap_to_pub);
+    publish_sensor_float("gap_source", from_sensor ? 1.0f : 0.0f);  // 1=sensor, 0=estimado
+
+    // ===== Potenciómetro / KV: SIEMPRE MQTT; logs solo si stepper se mueve =====
     float theta = Potenciometro_get_grados_filtrado();
     theta = clampf(theta, 0.0f, 3600.0f);
     float kv_now     = deg_to_kv_off(theta, g_params.kvFS, HOME_DEG_OFFSET);
@@ -635,7 +726,6 @@ static void telemetry_task(void *arg) {
     vTaskDelay(pdMS_TO_TICKS(period_ms));
   }
 }
-
 
 static void grafcet_task(void*){
   log_line("⚙️ Simulador GRAFCET listo.\n");
@@ -794,7 +884,7 @@ static void needle_task(void *arg)
     vTaskDelayUntil(&last, LOOP_TICK);
   }
 }
-
+  
 // Handlers
 
 static bool mh_handler(int s_idx){
@@ -946,7 +1036,10 @@ static bool sh_handler(int s_idx){
     return false;
   }
 
-  log_line("✅ [sh] OK → 0.0° (~150 mm)");
+  log_line("✅ [sh] OK → 180.0° (~150 mm)");
+  float expected_gap = angle_to_gap_mm(180.0f);   // homing = servo 180°
+  refresh_last_gap_best_effort(expected_gap);
+  (void)probe_laser(NULL, NULL);  // intenta actualizar g_last_gap_mm si hay lectura
   return true;
 }
 
@@ -954,39 +1047,54 @@ static bool spd_handler(int s_idx)
 {
   (void)s_idx;
 
-  // 1) Decide target según modo (y clámpealo)
+  // 1) Target según modo
   float target_mm;
   if (modo == MODO_AUTOMATICO) {
     target_mm = clampf(g_params.gap, NEEDLE_MIN_MM, NEEDLE_MAX_MM);
     if (target_mm != g_params.gap) g_params.gap = target_mm;
   } else {
-    // MANUAL / CICLO / ETAPA: ir a home (0°)
+    // MANUAL / CICLO / ETAPA →
+    float expected_gap = angle_to_gap_mm(0.0f);
+    refresh_last_gap_best_effort(expected_gap);   // ← ACTUALIZA ANTES DE ACTUAR
+
     mover_servo_task = false;
     if (!ServoSG90_SetAngleDeg(&servo, 0.0f, smsg, sizeof(smsg))) {
       log_line("❌ [spd] set servo 0°: %s", smsg);
+      refresh_last_gap_best_effort(expected_gap); // ← ACTUALIZA ANTES DE RETURN
+      (void)probe_laser(NULL, NULL);  // intenta actualizar g_last_gap_mm si hay lectura
       return false;
     }
-    log_line("✅ [spd] MAN/CICLO/ETAPA → servo=0° (≈150 mm)");
+    log_line("✅ [spd] MAN/CICLO/ETAPA → servo=0°");
+    refresh_last_gap_best_effort(expected_gap);   // ← ACTUALIZA ANTES DE RETURN
+    (void)probe_laser(NULL, NULL);  // intenta actualizar g_last_gap_mm si hay lectura
     return true;
   }
 
-  // ===== ORDEN CORRECTO DE CHEQUEOS =====
+  // ===== Orden correcto de chequeos =====
+
   // A) Si la task está en curso, seguimos esperando
   if (mover_servo_task) {
+    // Publica “verdad única” cada vez que preguntan spd, usando expectativa (target)
+    refresh_last_gap_best_effort(target_mm);      // ← ACTUALIZA ANTES DE RETURN
+    (void)probe_laser(NULL, NULL);  // intenta actualizar g_last_gap_mm si hay lectura
     return false;
   }
 
-  // B) Si la task YA terminó y marcó llegada (incluye lazo abierto)
+  // B) Si la task YA terminó y marcó llegada
   if (g_spd_reached) {
-    g_spd_reached = false;   // listo para el próximo SPD
+    g_spd_reached = false;
     log_line("✅ [spd] OK (target %.1f mm)", target_mm);
+    refresh_last_gap_best_effort(target_mm);      // ← ACTUALIZA ANTES DE RETURN
+    (void)probe_laser(NULL, NULL);  // intenta actualizar g_last_gap_mm si hay lectura
     return true;
   }
 
-  // C) Si no está en curso ni marcada como terminada → iniciar nueva corrida
-  g_spd_reached   = false;
-  mover_servo_task = true;   // needle_task comienza a moverse hacia g_params.gap
+  // C) Iniciar nueva corrida
+  g_spd_reached    = false;
+  mover_servo_task = true;
   log_line("[spd] start → target=%.1f mm (task ON)", target_mm);
+  refresh_last_gap_best_effort(target_mm);        // ← ACTUALIZA ANTES DE RETURN
+  (void)probe_laser(NULL, NULL);  // intenta actualizar g_last_gap_mm si hay lectura
   return false;
 }
 
@@ -2039,79 +2147,45 @@ static void i2c_force_release(gpio_num_t sda, gpio_num_t scl) {
 void app_main(void)
 {
   // --- INIT ---
-
-  bool lok = VL53L0X_Init(&laser, lmsg, sizeof(lmsg));
-  printf("Laser Init: %s (ok=%d)\n", lmsg, lok);
-  if (!lok) { printf("⚠️  Verifica VCC/GND/SDA/SCL/XSHUT.\n"); while(1) vTaskDelay(pdMS_TO_TICKS(1000)); }
-  char rr[32];
-  uint16_t u = 0;
-  bool ok = VL53L0X_ReadDistanceMM(&laser, &u, rr, sizeof(rr));
-  printf("[probe] ok=%d dist=%u mm msg=%s\n", ok ? 1 : 0, (unsigned)u, rr);
-
-  g_gap_mutex = xSemaphoreCreateMutex();
-  if (!g_gap_mutex) {
-    printf("❌ No se pudo crear g_gap_mutex\n");
-    while (1) vTaskDelay(pdMS_TO_TICKS(1000));
-  }
-
-  if (!ServoSG90_Init(&servo, smsg, sizeof(smsg))) {
-    printf("❌ Servo Init: %s\n", smsg);
-    while (1) vTaskDelay(pdMS_TO_TICKS(1000));
-  }
-  printf("Servo Init: %s\n", smsg);
-  (void)ServoSG90_SetAngleDeg(&servo, 90.0f, smsg, sizeof(smsg));
-
-  Potenciometro_init();
-  stepper_init(&g_motor, STEP_PIN, DIR_PIN, EN_PIN, 10*1000000);
-  stepper_enable(&g_motor, true);
-
-  // // --- Red + MQTT ---
+  initLaser();
+  initServo();
+  initStepper();
   net_eg = xEventGroupCreate();
   xTaskCreatePinnedToCore(net_task, "net", 4096, NULL, 5, NULL, 0);
   wifi_init_sta();
   vTaskDelay(pdMS_TO_TICKS(5000));  // pequeña pausa
 
+  
   xTaskCreatePinnedToCore(needle_task, "needle", 6144, NULL, 5, NULL, 1);
   xTaskCreatePinnedToCore(telemetry_task, "telemetry", 4096, NULL, 6, NULL, 0);
   xTaskCreatePinnedToCore(pid_control_task,"pid",     6144, NULL, 5, NULL, 1);
   // // xTaskCreatePinnedToCore(comando_task,  "cmd",       4096, NULL, 3, NULL, 1);
   // // xTaskCreatePinnedToCore(grafcet_task,  "grafcet",   6144, NULL, 4, NULL, 1);
 
-  // registrar_handler_sensor("sh", sh_handler);
-  // registrar_handler_sensor("spd", spd_handler);
-  // registrar_handler_sensor("mh", mh_handler);
-  // registrar_handler_sensor("mpd", mpd_handler);
+  registrar_handler_sensor("sh", sh_handler);
+  registrar_handler_sensor("spd", spd_handler);
+  registrar_handler_sensor("mh", mh_handler);
+  registrar_handler_sensor("mpd", mpd_handler);
 
-  // // ================================
-  // // PRUEBAS DE HANDLERS SIN GRAFCET
-  // // ================================
+  // PRUEBAS DE HANDLERS SIN GRAFCET
   modo = MODO_MANUAL;
 
   log_line("=== TEST SH_HANDLER ===");
-  mover_servo_task = false;   // desactivar control automático
+  vTaskDelay(pdMS_TO_TICKS(3000));  // espera 3 s
   bool ok_sh = sh_handler(-1);
   log_line("sh_handler() → %s", ok_sh ? "OK" : "FAIL");
-  vTaskDelay(pdMS_TO_TICKS(3000));  // espera 3 s
+  
 
   log_line("=== TEST SPD MANUAL ===");
-  mover_servo_task = true;   // desactivar control automático
-  modo = MODO_MANUAL;
   while (!spd_handler(-1)) vTaskDelay(pdMS_TO_TICKS(200));
 
   log_line("=== SH_HANDLER ===");
   vTaskDelay(pdMS_TO_TICKS(3000));  // espera 3 s
-  mover_servo_task = false;   // desactivar control automático
   bool ok_sh2 = sh_handler(-1);
   log_line("sh_handler() → %s", ok_sh2 ? "OK" : "FAIL");
 
-  // vTaskDelay(pdMS_TO_TICKS(3000));  // espera 3 s
-  // mover_servo_task = false;   // desactivar control automático
-  // bool ok_sh3 = sh_handler(-1);
-  // log_line("sh_handler() → %s", ok_sh3 ? "OK" : "FAIL");
-
   log_line("=== TEST SPD_HANDLER AUTO ===");
-  bool oksss = VL53L0X_ReadDistanceMM(&laser, &u, rr, sizeof(rr));
-  printf("[probe 2] ok=%d dist=%u mm msg=%s\n", oksss ? 1 : 0, (unsigned)u, rr);
+  pruebas_laser();
   vTaskDelay(pdMS_TO_TICKS(3000));  // espera 3 s
   modo = MODO_AUTOMATICO;
   bool ok_spd = false;
@@ -2120,10 +2194,7 @@ void app_main(void)
     vTaskDelay(pdMS_TO_TICKS(200));
   }
   log_line("spd_handler() → %s", ok_spd ? "OK" : "FAIL");
-
-  bool oks2 = VL53L0X_ReadDistanceMM(&laser, &u, rr, sizeof(rr));
-  printf("[probe 2] ok=%d dist=%u mm msg=%s\n", oks2 ? 1 : 0, (unsigned)u, rr);
-  vTaskDelay(pdMS_TO_TICKS(3000));  // espera 3 s
+  pruebas_laser();
 
   log_line("=== TEST MPD ===");
   vTaskDelay(pdMS_TO_TICKS(3000));  // pequeña pausa
@@ -2134,14 +2205,14 @@ void app_main(void)
   }
   log_line("mpd_handler() → %s", ok_mpd ? "OK" : "FAIL");
 
-  // log_line("=== TEST MH ===");
-  // vTaskDelay(pdMS_TO_TICKS(3000));  // pequeña pausa
-  // modo = MODO_MANUAL;
-  // bool ok_mh = false;
-  // while (!(ok_mh = mh_handler(-1))) {
-  //   vTaskDelay(pdMS_TO_TICKS(200));
-  // }
-  // log_line("mh_handler() → %s", ok_mh ? "OK" : "FAIL");
+  log_line("=== TEST MH ===");
+  vTaskDelay(pdMS_TO_TICKS(3000));  // pequeña pausa
+  modo = MODO_MANUAL;
+  bool ok_mh = false;
+  while (!(ok_mh = mh_handler(-1))) {
+    vTaskDelay(pdMS_TO_TICKS(200));
+  }
+  log_line("mh_handler() → %s", ok_mh ? "OK" : "FAIL");
 
 }
 
