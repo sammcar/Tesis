@@ -3,9 +3,13 @@
 
 import { subscribeLogs, publishText, subscribeState, subscribeFault, subscribeCamFrame, DEVICE_ID } from "@/lib/mqttClient";
 import {CAM_DEVICE_ID} from "@/lib/mqttClient";
+import { publishCamLed} from "@/lib/mqttClient";
 import { useEffect, useMemo, useRef, useState } from "react";
 import Link from "next/link";
 import { ArrowLeft, Power, RefreshCcw, Camera, TerminalSquare } from "lucide-react";
+import { subscribeSeries } from "@/lib/mqttClient";
+import { X } from "lucide-react";
+
 
 import {
   AlertDialog,
@@ -48,8 +52,16 @@ export default function VerificarPage() {
   const [faultTitle, setFaultTitle] = useState<string>("");
   const [faultDesc, setFaultDesc] = useState<string>("");
   const [shakeTick, setShakeTick] = useState(0);
+  const [camLedOn, setCamLedOn] = useState(false);
 
   const prevModeRef = useRef<Mode>("ciclo");
+
+  // ----- series (monitoreo rápido) -----
+  const [voltageSeries, setVoltageSeries] = useState<number[]>([]);
+  const [distanceSeries, setDistanceSeries] = useState<number[]>([]);
+  const [zoomOpen, setZoomOpen] = useState(false);
+  const [zoomKind, setZoomKind] = useState<"camera" | "voltage" | "distance" | null>(null);
+
 
   useEffect(() => {
     const prev = prevModeRef.current;
@@ -118,6 +130,30 @@ export default function VerificarPage() {
     return () => off?.();
   }, []);
 
+  // Series en tiempo real (kV y mm)
+useEffect(() => {
+  // VOLTAJE (kV)
+  const offV = subscribeSeries(DEVICE_ID, "voltage_kv", (v) => {
+    setVoltageSeries((s) => {
+      const next = [...s, v];
+      if (next.length > 600) next.shift();
+      return next;
+    });
+  });
+
+  // DISTANCIA (mm)
+  const offD = subscribeSeries(DEVICE_ID, "laser_mm", (v) => {
+    setDistanceSeries((s) => {
+      const next = [...s, v];
+      if (next.length > 600) next.shift();
+      return next;
+    });
+  });
+
+  return () => { offV?.(); offD?.(); };
+}, []);
+
+
   const sendCommand = (cmd: string) => {
     if (!cmd.trim()) return;
     const now = new Date().toLocaleTimeString();
@@ -173,6 +209,13 @@ export default function VerificarPage() {
   const glass = "border border-white/15 bg-white/10 backdrop-blur-lg";
   const card = `rounded-2xl ${glass} p-4 shadow-[0_8px_30px_rgba(0,0,0,0.12)]`;
   const titleClass = "text-sm font-medium text-white/90";
+
+  // justo arriba del `return ( ... )`, junto a tus otros handlers
+const openZoom = (kind: "camera" | "voltage" | "distance") => {
+  setZoomKind(kind);
+  setZoomOpen(true);
+};
+
 
   return (
     <section className="mx-auto w-full max-w-6xl p-6 md:p-10">
@@ -306,28 +349,56 @@ export default function VerificarPage() {
                   {camMqttOk ? "MQTT cam: activo" : "MQTT cam: esperando…"}
                 </span>
               </div>
-              <button
-                type="button"
-                onClick={() => !faultLatched && setCameraTick((t) => t + 1)}
-                className="inline-flex items-center gap-2 rounded-xl border border-white/15 bg-white/10 px-3 py-2 text-xs text-white/90 hover:bg-white/15"
-                disabled={estopActive || faultLatched}
-                title="Refrescar snapshot"
-              >
-                <RefreshCcw className="h-4 w-4" />
-                Refrescar
-              </button>
+
+              {/* Acciones (zoom + LED) */}
+              <div className="flex items-center gap-2">
+                {/* Nuevo: Zoom cámara */}
+                <button
+                  type="button"
+                  onClick={() => openZoom("camera")}
+                  className="inline-flex items-center gap-2 rounded-xl border border-white/15 bg-white/10 px-3 py-2 text-xs text-white/90 hover:bg-white/15"
+                  title="Ampliar cámara"
+                >
+                  <Camera className="h-4 w-4" />
+                  Zoom
+                </button>
+
+                {/* LED toggle (igual que antes) */}
+                <button
+                  type="button"
+                  onClick={() => {
+                    if (estopActive || faultLatched) return;
+                    const next = !camLedOn;
+                    setCamLedOn(next);                        // optimista
+                    publishCamLed(next, CAM_DEVICE_ID);       // cams/<id>/led → "true"/"false"
+                  }}
+                  className={[
+                    "inline-flex items-center gap-2 rounded-xl px-3 py-2 text-xs font-medium transition",
+                    camLedOn
+                      ? "bg-amber-500/80 text-black hover:bg-amber-400"
+                      : "border border-white/15 bg-white/10 text-white/90 hover:bg-white/15",
+                  ].join(" ")}
+                  disabled={estopActive || faultLatched}
+                  title={camLedOn ? "Apagar LED" : "Encender LED"}
+                >
+                  {camLedOn ? "LED ON" : "LED OFF"}
+                </button>
+              </div>
+
             </div>
+
             <div className="overflow-hidden rounded-xl border border-white/10 bg-black/40">
               <img
                 src={frameUrl ?? cameraUrl} // MQTT dataURL o mock
                 alt="Stream cámara (ESP32-CAM)"
-                className="h-auto w-full object-cover"
+                className="h-auto w-full object-cover rotate-180"
               />
             </div>
             <p className="mt-2 text-xs text-white/70">
               {frameUrl ? "Frames vía MQTT (base64)." : `Snapshot mock cada ~${cameraRefreshMs / 1000}s.`}
             </p>
           </div>
+
         </div>
 
         {/* Derecha: controles y modo */}
@@ -478,6 +549,28 @@ export default function VerificarPage() {
             </div>
           </div>
 
+          {/* ===== Gráficas de verificación ===== */}
+          <ChartCard
+            title="Voltaje (kV)"
+            onZoom={() => openZoom("voltage")}
+            series={voltageSeries}
+            unit="kV"
+            yMin={0}
+            yMax={40}
+            stroke="#0b4f9c"
+          />
+
+          <ChartCard
+            title="Distancia (mm)"
+            onZoom={() => openZoom("distance")}
+            series={distanceSeries}
+            unit="mm"
+            yMin={0}
+            yMax={300}
+            stroke="#0b7d3b"
+          />
+
+
           {/* Modal de Falla */}
           <AlertDialog open={faultOpen} onOpenChange={setFaultOpen}>
             <AlertDialogContent
@@ -510,6 +603,50 @@ export default function VerificarPage() {
             </AlertDialogContent>
           </AlertDialog>
         </div>
+        {/* ===== Modal de Zoom (cámara / charts) ===== */}
+        <AlertDialog open={zoomOpen} onOpenChange={setZoomOpen}>
+          <AlertDialogContent className="max-w-5xl rounded-2xl border border-white/15 bg-black/80 text-white">
+            <div className="flex items-center justify-between">
+              <AlertDialogTitle className="text-white">
+                {zoomKind === "camera" ? "Cámara" : zoomKind === "voltage" ? "Voltaje (kV)" : "Distancia (mm)"}
+              </AlertDialogTitle>
+              <button
+                className="rounded-md p-1 text-white/80 hover:text-white"
+                onClick={() => setZoomOpen(false)}
+                aria-label="Cerrar"
+              >
+                <X className="h-5 w-5" />
+              </button>
+            </div>
+
+            <div className="mt-4">
+              {zoomKind === "camera" && (
+                <CameraZoomView src={frameUrl ?? cameraUrl} />
+              )}
+              {zoomKind === "voltage" && (
+                <BigChart
+                  series={voltageSeries}
+                  unit="kV"
+                  yMin={0}
+                  yMax={40}
+                  stroke="#0b4f9c"
+                  title="Voltaje (kV)"
+                />
+              )}
+              {zoomKind === "distance" && (
+                <BigChart
+                  series={distanceSeries}
+                  unit="mm"
+                  yMin={0}
+                  yMax={300}
+                  stroke="#0b7d3b"
+                  title="Distancia (mm)"
+                />
+              )}
+            </div>
+          </AlertDialogContent>
+        </AlertDialog>
+
       </div>
     </section>
   );
@@ -604,3 +741,233 @@ function CommTestRow({
     </div>
   );
 }
+
+// === Cámara con zoom/pan ===
+function CameraZoomView({ src }: { src: string }) {
+  const [zoom, setZoom] = useState(1.6);
+  const [pan, setPan] = useState({ x: 0, y: 0 });
+  const [drag, setDrag] = useState<{active: boolean; sx: number; sy: number; ox: number; oy: number;}>({
+    active: false, sx: 0, sy: 0, ox: 0, oy: 0,
+  });
+
+  return (
+    <div
+      className="relative mx-auto max-h-[70vh] w-full overflow-hidden rounded-xl border border-white/15 bg-black/60"
+      onWheel={(e) => {
+        e.preventDefault();
+        const delta = e.deltaY > 0 ? -0.15 : 0.15;
+        setZoom(z => Math.min(4, Math.max(1, z + delta)));
+      }}
+      onMouseDown={(e) => {
+        setDrag({ active: true, sx: e.clientX, sy: e.clientY, ox: pan.x, oy: pan.y });
+      }}
+      onMouseMove={(e) => {
+        if (!drag.active) return;
+        setPan({ x: drag.ox + (e.clientX - drag.sx), y: drag.oy + (e.clientY - drag.sy) });
+      }}
+      onMouseUp={() => setDrag(d => ({ ...d, active: false }))}
+      onMouseLeave={() => setDrag(d => ({ ...d, active: false }))}
+    >
+      {/* HUD */}
+      <div className="pointer-events-none absolute right-2 top-2 z-10 flex gap-2">
+        <div className="pointer-events-auto rounded-md bg-black/50 px-2 py-1 text-xs text-white/80">
+          {zoom.toFixed(2)}×
+        </div>
+        <button
+          className="pointer-events-auto rounded-md bg-black/50 px-2 py-1 text-xs text-white/90 hover:bg-black/60"
+          onClick={() => { setZoom(1.6); setPan({ x: 0, y: 0 }); }}
+        >
+          Reset
+        </button>
+      </div>
+
+      {/* 🔄 Rotación 180° aislada en un wrapper para no romper el pan/zoom */}
+      <div className="rotate-180">
+        <img
+          src={src}
+          alt="Cámara ampliada"
+          draggable={false}
+          className="select-none"
+          style={{
+            transform: `translate(${pan.x}px, ${pan.y}px) scale(${zoom})`,
+            transformOrigin: "center center",
+            width: "100%",
+            height: "auto",
+            userSelect: "none",
+            pointerEvents: "none",
+          }}
+        />
+      </div>
+    </div>
+  );
+}
+
+
+// === Card de gráfica pequeña (click → zoom) ===
+function ChartCard({
+  title, series, unit, yMin, yMax, stroke, onZoom,
+}: {
+  title: string;
+  series: number[];
+  unit: string;
+  yMin: number;
+  yMax: number;
+  stroke: string;
+  onZoom?: () => void;
+}) {
+  return (
+    <div className="rounded-2xl border border-white/15 bg-white/10 p-4 shadow-[0_4px_20px_rgba(0,0,0,0.18)]">
+      <div className="mb-2 flex items-center justify-between">
+        <p className="text-sm font-medium text-white/90">{title}</p>
+        <button
+          onClick={onZoom}
+          className="rounded-md border border-white/15 bg-white/10 px-2 py-1 text-xs text-white/80 hover:bg-white/15"
+          title="Ampliar"
+        >
+          Zoom
+        </button>
+      </div>
+      <MiniChart series={series} unit={unit} yMin={yMin} yMax={yMax} stroke={stroke} />
+    </div>
+  );
+}
+
+function MiniChart({
+  series, unit, yMin, yMax, stroke,
+}: {
+  series: number[];
+  unit: string;
+  yMin: number;
+  yMax: number;
+  stroke: string;
+}) {
+  const w = 520, h = 220, padL = 48, padR = 12, padT = 16, padB = 32;
+  return (
+    <ChartSVG
+      series={series}
+      unit={unit}
+      yMin={yMin}
+      yMax={yMax}
+      stroke={stroke}
+      width={w}
+      height={h}
+      padL={padL}
+      padR={padR}
+      padT={padT}
+      padB={padB}
+    />
+  );
+}
+
+function BigChart({
+  series, unit, yMin, yMax, stroke, title,
+}: {
+  series: number[];
+  unit: string;
+  yMin: number;
+  yMax: number;
+  stroke: string;
+  title: string;
+}) {
+  const w = 1000, h = 420, padL = 56, padR = 16, padT = 24, padB = 40;
+  return (
+    <div className="rounded-xl border border-white/15 bg-white p-2">
+      <p className="px-2 pt-1 text-sm font-medium text-gray-700">{title}</p>
+      <ChartSVG
+        series={series}
+        unit={unit}
+        yMin={yMin}
+        yMax={yMax}
+        stroke={stroke}
+        width={w}
+        height={h}
+        padL={padL}
+        padR={padR}
+        padT={padT}
+        padB={padB}
+      />
+    </div>
+  );
+}
+
+function ChartSVG({
+  series, unit, yMin, yMax, stroke,
+  width, height, padL, padR, padT, padB,
+}: {
+  series: number[];
+  unit: string;
+  yMin: number;
+  yMax: number;
+  stroke: string;
+  width: number;
+  height: number;
+  padL: number;
+  padR: number;
+  padT: number;
+  padB: number;
+}) {
+  const clamp = (v: number, lo: number, hi: number) => Math.min(hi, Math.max(lo, v));
+  const plotW = width - padL - padR;
+  const plotH = height - padT - padB;
+
+  const n = series.length;
+  const dtSec = 0.15; // mock visual
+  const xToSec = (i: number) => Math.max(0, (n - 1 - i) * dtSec);
+
+  const yScale = (v: number) => {
+    const t = clamp((v - yMin) / Math.max(1e-6, yMax - yMin), 0, 1);
+    return padT + (1 - t) * plotH;
+  };
+  const xScale = (i: number) => padL + (plotW * i) / Math.max(1, n - 1);
+
+  const pts = useMemo(() => {
+    if (!n) return "";
+    return series.map((v, i) => `${xScale(i)},${yScale(v)}`).join(" ");
+  }, [series, plotW, plotH]);
+
+  const yTicks = 5;
+  const xTicks = 6;
+  const yTickVals = Array.from({ length: yTicks + 1 }, (_, k) => yMin + (k * (yMax - yMin)) / yTicks);
+  const xTickIdxs = Array.from({ length: xTicks + 1 }, (_, k) => Math.round((k * (n - 1)) / xTicks));
+
+  return (
+    <div className="overflow-hidden rounded-xl border border-white/10 bg-white">
+      <svg width="100%" height={height} viewBox={`0 0 ${width} ${height}`} preserveAspectRatio="none">
+        <rect x="0" y="0" width={width} height={height} fill="white" />
+        <rect x={padL} y={padT} width={plotW} height={plotH} fill="white" stroke="#E5E7EB" />
+        <line x1={padL} y1={padT} x2={padL} y2={padT + plotH} stroke="#9CA3AF" />
+        <line x1={padL} y1={padT + plotH} x2={padL + plotW} y2={padT + plotH} stroke="#9CA3AF" />
+
+        {yTickVals.map((v, i) => {
+          const y = yScale(v);
+          return (
+            <g key={`y-${i}`}>
+              <line x1={padL} y1={y} x2={padL + plotW} y2={y} stroke="#E5E7EB" />
+              <text x={padL - 6} y={y + 4} textAnchor="end" fontSize="10" fill="#374151">
+                {v.toFixed(0)}
+              </text>
+            </g>
+          );
+        })}
+
+        {xTickIdxs.map((idx, i) => {
+          const x = xScale(idx);
+          const sec = xToSec(idx);
+          return (
+            <g key={`x-${i}`}>
+              <line x1={x} y1={padT} x2={x} y2={padT + plotH} stroke="#E5E7EB" />
+              <text x={x} y={padT + plotH + 14} textAnchor="middle" fontSize="10" fill="#374151">
+                {sec.toFixed(0)}s
+              </text>
+            </g>
+          );
+        })}
+
+        <polyline points={pts} fill="none" stroke={stroke} strokeWidth="2" />
+        <text x={padL - 34} y={padT - 4} textAnchor="start" fontSize="10" fill="#374151">{unit}</text>
+        <text x={padL + plotW} y={padT + plotH + 26} textAnchor="end" fontSize="10" fill="#374151">tiempo (s)</text>
+      </svg>
+    </div>
+  );
+}
+

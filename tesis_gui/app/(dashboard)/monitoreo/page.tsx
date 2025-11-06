@@ -4,6 +4,7 @@
 import { subscribeLogs, publishText, subscribeSeries, subscribeState, subscribeFault, DEVICE_ID } from "@/lib/mqttClient";
 import { useEffect, useMemo, useRef, useState } from "react";
 import Link from "next/link";
+import { subscribeCamFrame, CAM_DEVICE_ID, publishCamLed } from "@/lib/mqttClient";
 import { useRouter } from "next/navigation";
 import Spline from "@splinetool/react-spline";
 import {
@@ -38,7 +39,10 @@ export default function MonitoreoPage() {
   const [inputLine, setInputLine] = useState("");
   const inputRef = useRef<HTMLInputElement>(null);
 
-  // ----- cámara (mock) -----
+  // ----- cámara (mqtt + fallback mock) -----
+  const [frameUrl, setFrameUrl] = useState<string | null>(null);
+  const [camMqttOk, setCamMqttOk] = useState(false);
+  const [camLedOn, setCamLedOn] = useState(false);
   const [cameraTick, setCameraTick] = useState(0);
   const cameraRefreshMs = 3000;
   const cameraUrl = useMemo(
@@ -46,7 +50,8 @@ export default function MonitoreoPage() {
     [cameraTick]
   );
 
-  // ----- series (mock) -----
+
+  // ----- series -----
   const [voltageSeries, setvoltageSeries] = useState<number[]>([]);
   const [distanceSeries, setDistanceSeries] = useState<number[]>([]);
 
@@ -143,7 +148,7 @@ export default function MonitoreoPage() {
   });
 
   // DISTANCIA (mm)
-  const offD = subscribeSeries(DEVICE_ID, "distance_mm", (v) => {
+  const offD = subscribeSeries(DEVICE_ID, "laser_mm", (v) => {
     setDistanceSeries(s => {
       const next = [...s, v];
       if (next.length > 600) next.shift();
@@ -155,14 +160,31 @@ export default function MonitoreoPage() {
 }, []);
 
 
-  // ======== Cámara (mock) ========
+  // ======== Cámara ========
+
+  // Frames por MQTT (dataURL base64) + “esperando” a 5s si no llega nada
   useEffect(() => {
+    const off = subscribeCamFrame(CAM_DEVICE_ID, (dataUrl) => {
+      if (typeof dataUrl === "string" && dataUrl.startsWith("data:image/")) {
+        setFrameUrl(dataUrl);
+        setCamMqttOk(true);
+      }
+    });
+    const t = setTimeout(() => { if (!frameUrl) setCamMqttOk(false); }, 5000);
+    return () => { off?.(); clearTimeout(t); };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  // Fallback mock: solo refresca si no hay frame MQTT, y si no hay estop/falla/fin
+  useEffect(() => {
+    if (frameUrl) return;
     const id = setInterval(() => {
       if (estopRef.current || faultRef.current || finishRef.current) return;
       setCameraTick(t => t + 1);
     }, cameraRefreshMs);
     return () => clearInterval(id);
-  }, []);
+  }, [frameUrl, cameraRefreshMs]);
+
 
   useEffect(() => {
   sendCommand("modo automatico");
@@ -557,31 +579,73 @@ const handleFaultReset = () => {
             <div className="mb-3 flex items-center justify-between">
               <div className="flex items-center gap-2">
                 <Camera className="h-5 w-5 text-white/80" />
-                <p className={title}>Cámara (ESP32-CAM · mock)</p>
+                <p className="text-sm font-medium text-white/90">Cámara (ESP32-CAM)</p>
+                <span
+                  className={[
+                    "ml-2 rounded-lg border px-2 py-0.5 text-[11px]",
+                    camMqttOk
+                      ? "border-emerald-400/40 bg-emerald-500/20 text-emerald-200"
+                      : "border-yellow-400/40 bg-yellow-600/20 text-yellow-100",
+                  ].join(" ")}
+                  title={camMqttOk ? "Recibiendo frames por MQTT" : "Esperando frames por MQTT"}
+                >
+                  {camMqttOk ? "MQTT cam: activo" : "MQTT cam: esperando…"}
+                </span>
               </div>
-              <button
-                type="button"
-                onClick={() => setCameraTick(t => t + 1)}
-                className="inline-flex items-center gap-2 rounded-xl border border-white/15 bg-black/30 px-3 py-2 text-xs text-white/90 hover:bg-black/40"
-                disabled={estopActive || faultLatched || finishOpen}
-                title="Refrescar snapshot"
-              >
-                <RefreshCcw className="h-4 w-4" />
-                Refrescar
-              </button>
+
+              <div className="flex items-center gap-2">
+                {/* Zoom abre el modal */}
+                <button
+                  type="button"
+                  onClick={() => openZoom("camera")}
+                  className="inline-flex items-center gap-2 rounded-xl border border-white/15 bg-black/30 px-3 py-2 text-xs text-white/90 hover:bg-black/40"
+                  title="Ampliar cámara"
+                >
+                  <Camera className="h-4 w-4" />
+                  Zoom
+                </button>
+
+                {/* LED ON/OFF por MQTT (optimista) */}
+                <button
+                  type="button"
+                  onClick={() => {
+                    if (estopActive || faultLatched || finishOpen) return;
+                    const next = !camLedOn;
+                    setCamLedOn(next);
+                    publishCamLed(next, CAM_DEVICE_ID);
+                  }}
+                  className={[
+                    "inline-flex items-center gap-2 rounded-xl px-3 py-2 text-xs font-medium transition",
+                    camLedOn
+                      ? "bg-amber-500/80 text-black hover:bg-amber-400"
+                      : "border border-white/15 bg-black/30 text-white/90 hover:bg-black/40",
+                  ].join(" ")}
+                  disabled={estopActive || faultLatched || finishOpen}
+                  title={camLedOn ? "Apagar LED" : "Encender LED"}
+                >
+                  {camLedOn ? "LED ON" : "LED OFF"}
+                </button>
+              </div>
             </div>
 
+            {/* Imagen: MQTT si existe, si no mock; quita rotate si no la necesitas */}
             <button
               type="button"
               onClick={() => openZoom("camera")}
               className="block w-full overflow-hidden rounded-xl border border-white/10 bg-black/60 focus:outline-none"
               title="Ampliar"
-              disabled={false}
             >
-              <img src={cameraUrl} alt="Snapshot" className="h-auto w-full object-cover" />
+              <img
+                src={frameUrl ?? cameraUrl}
+                alt="Snapshot"
+                className="h-auto w-full object-cover rotate-180"
+              />
             </button>
-            <p className="mt-2 text-xs text-white/70">Click para ampliar · snapshot cada ~{cameraRefreshMs / 1000}s.</p>
+            <p className="mt-2 text-xs text-white/70">
+              {frameUrl ? "Frames vía MQTT (base64)." : `Snapshot mock cada ~${cameraRefreshMs / 1000}s.`}
+            </p>
           </div>
+
 
           {/* gráficas */}
           <ChartCard
@@ -696,11 +760,7 @@ const handleFaultReset = () => {
 
           <div className="mt-4">
             {zoomKind === "camera" && (
-              <img
-                src={cameraUrl}
-                alt="Cámara ampliada"
-                className="mx-auto max-h-[70vh] w-auto rounded-xl border border-white/15"
-              />
+              <CameraZoomView src={frameUrl ?? cameraUrl} />
             )}
             {zoomKind === "voltage" && (
               <BigChart
@@ -737,6 +797,65 @@ function CommLight({ label, ok }: { label: string; ok: boolean }) {
       <span className={cn("text-sm", ok ? "text-white/90" : "text-rose-200/90")}>
         {label} {ok ? "OK" : "ERROR"}
       </span>
+    </div>
+  );
+}
+
+function CameraZoomView({ src }: { src: string }) {
+  const [zoom, setZoom] = useState(1.6);
+  const [pan, setPan] = useState({ x: 0, y: 0 });
+  const [drag, setDrag] = useState<{active: boolean; sx: number; sy: number; ox: number; oy: number;}>({
+    active: false, sx: 0, sy: 0, ox: 0, oy: 0,
+  });
+
+  return (
+    <div
+      className="relative mx-auto max-h-[70vh] w-full overflow-hidden rounded-xl border border-white/15 bg-black/60"
+      onWheel={(e) => {
+        e.preventDefault();
+        const delta = e.deltaY > 0 ? -0.15 : 0.15;
+        setZoom(z => Math.min(4, Math.max(1, z + delta)));
+      }}
+      onMouseDown={(e) => {
+        setDrag({ active: true, sx: e.clientX, sy: e.clientY, ox: pan.x, oy: pan.y });
+      }}
+      onMouseMove={(e) => {
+        if (!drag.active) return;
+        setPan({ x: drag.ox + (e.clientX - drag.sx), y: drag.oy + (e.clientY - drag.sy) });
+      }}
+      onMouseUp={() => setDrag(d => ({ ...d, active: false }))}
+      onMouseLeave={() => setDrag(d => ({ ...d, active: false }))}
+    >
+      {/* HUD */}
+      <div className="pointer-events-none absolute right-2 top-2 z-10 flex gap-2">
+        <div className="pointer-events-auto rounded-md bg-black/50 px-2 py-1 text-xs text-white/80">
+          {zoom.toFixed(2)}×
+        </div>
+        <button
+          className="pointer-events-auto rounded-md bg-black/50 px-2 py-1 text-xs text-white/90 hover:bg-black/60"
+          onClick={() => { setZoom(1.6); setPan({ x: 0, y: 0 }); }}
+        >
+          Reset
+        </button>
+      </div>
+
+      {/* 🔄 Rotación 180° aislada en un wrapper para no romper el pan/zoom */}
+      <div className="rotate-180">
+        <img
+          src={src}
+          alt="Cámara ampliada"
+          draggable={false}
+          className="select-none"
+          style={{
+            transform: `translate(${pan.x}px, ${pan.y}px) scale(${zoom})`,
+            transformOrigin: "center center",
+            width: "100%",
+            height: "auto",
+            userSelect: "none",
+            pointerEvents: "none",
+          }}
+        />
+      </div>
     </div>
   );
 }

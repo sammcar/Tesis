@@ -44,6 +44,12 @@ export function getClient() {
   return client;
 }
 
+export function publishCamLed(on: boolean, deviceId: string = CAM_DEVICE_ID) {
+  const c = getClient();
+  const topic = `cams/${deviceId}/led`;
+  c.publish(topic, on ? "true" : "false", { qos: 1, retain: true });
+}
+
 // ===== GUI -> ESP (texto/console) =====
 export function publishText(deviceId: string, line: string) {
   const c = getClient();
