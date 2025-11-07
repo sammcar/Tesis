@@ -2142,79 +2142,230 @@ static void i2c_force_release(gpio_num_t sda, gpio_num_t scl) {
   vTaskDelay(pdMS_TO_TICKS(2));
 }
 
+
+void pruebaSyringe(void) {
+    printf("⚡ Iniciando prueba de SyringeRS232...\n");
+
+    Syringe_Init();
+
+    if (Syringe_VerifyConnection()) {
+        printf("✅ Comunicación con el Syringe exitosa.\n");
+    } else {
+        printf("❌ No se pudo comunicar con el Syringe.\n");
+    }
+}
+
+void example_syringe_sequence(void) {
+    char buf[64];
+    int len;
+
+    // 1) Init + Basic Mode persistente
+    Syringe_Init();
+    Syringe_SetAddress(0);
+    Syringe_ExitSafeMode();      // SAFO + "SAF 0"
+    vTaskDelay(pdMS_TO_TICKS(100));
+
+    // 2) VER + limpiar alarma Reset si aparece
+    uart_flush_input(SYRINGE_UART);
+    Syringe_SendCommand("VER");
+    len = Syringe_ReadResponse(buf, sizeof(buf), 1000);
+    if (len <= 0) { printf("❌ No responde VER\n"); return; }
+    printf("📥 Firmware raw: %s\n", buf);
+
+    if (strstr(buf, "A?R")) {
+        printf("⚠️ RESET alarm, doing PF 0...\n");
+        uart_flush_input(SYRINGE_UART);
+        Syringe_SendCommand("PF 0");
+        vTaskDelay(pdMS_TO_TICKS(100));
+        len = Syringe_ReadResponse(buf, sizeof(buf), 500);
+        printf("   PF0 resp: %s\n", buf);
+    }
+
+    uart_flush_input(SYRINGE_UART);
+    Syringe_SendCommand("VER");
+    len = Syringe_ReadResponse(buf, sizeof(buf), 500);
+    if (len <= 0) { printf("❌ No responde VER (2)\n"); return; }
+    printf("📥 Firmware: %s\n\n", buf);
+
+    // --- Ya en Basic Mode y sin alarmas ---
+
+    // 3) DIA 10.0
+    float dia;
+    uart_flush_input(SYRINGE_UART);
+    Syringe_QueryDiameter(&dia);
+    printf("🔍 DIA antes: %.1f mm\n", dia);
+
+    uart_flush_input(SYRINGE_UART);
+    Syringe_SetDiameter(10.0f);
+    vTaskDelay(pdMS_TO_TICKS(100));
+
+    uart_flush_input(SYRINGE_UART);
+    Syringe_QueryDiameter(&dia);
+    printf("⚙️ DIA ahora: %.1f mm\n\n", dia);
+
+    // 4) PHN 1
+    uint8_t phase;
+    uart_flush_input(SYRINGE_UART);
+    Syringe_SelectPhase(1);
+    vTaskDelay(pdMS_TO_TICKS(100));
+
+    uart_flush_input(SYRINGE_UART);
+    Syringe_QueryPhase(&phase);
+    printf("🔍 PHN: %u\n\n", phase);
+
+    // 5) FUN RAT
+    char func[16];
+    uart_flush_input(SYRINGE_UART);
+    Syringe_SetPhaseFunction("RAT");
+    vTaskDelay(pdMS_TO_TICKS(100));
+
+    uart_flush_input(SYRINGE_UART);
+    Syringe_QueryPhaseFunction(func, sizeof(func));
+    printf("🔍 FUN: %s\n\n", func);
+
+    // 6) Rate: 5 µL/min (Unidad y espacio exactos)
+    uart_flush_input(SYRINGE_UART);
+    Syringe_SendCommand("RAT 10.00 UM");
+    vTaskDelay(pdMS_TO_TICKS(100));
+
+    // Confirmación inmediata
+    uart_flush_input(SYRINGE_UART);
+    Syringe_SendCommand("RAT");
+    len = Syringe_ReadResponse(buf, sizeof(buf), 200);
+    if (len > 3) {
+        char *p = buf + 3;
+        float rate;
+        char runits[4];
+        sscanf(p, "%f %3s", &rate, runits);
+        printf("🔍 RAT: %.2f %s\n\n", rate, runits);
+    }
+
+    // 7) VOL 1.00 (use units defined by DIA)
+    uart_flush_input(SYRINGE_UART);
+    Syringe_SendCommand("VOL 100.00");  // o "VOL 1.00ULM" si el manual lo exige
+    vTaskDelay(pdMS_TO_TICKS(100));
+
+    uart_flush_input(SYRINGE_UART);
+    Syringe_SendCommand("VOL");         // Query según modelo
+    len = Syringe_ReadResponse(buf, sizeof(buf), 200);
+    printf("🔍 VOL = %s\n", buf+3);
+
+    // 8) DIR INF
+    char dbuf[8];
+    uart_flush_input(SYRINGE_UART);
+    Syringe_SetDirection("INF");
+    vTaskDelay(pdMS_TO_TICKS(100));
+
+    uart_flush_input(SYRINGE_UART);
+    Syringe_QueryDirection(dbuf, sizeof(dbuf));
+    printf("🔍 DIR: %s\n\n", dbuf);
+
+    // 9) CLD INF, CLD WDR + RUN
+    uart_flush_input(SYRINGE_UART);
+    Syringe_ClearDispensed("INF");
+    Syringe_ClearDispensed("WDR");
+    vTaskDelay(pdMS_TO_TICKS(100));
+
+    uart_flush_input(SYRINGE_UART);
+    Syringe_Run(1);  // Start phase 1
+    printf("▶️ RUN iniciado\n\n");
+
+    // 10) Monitor breve
+    for (int i = 0; i < 5; ++i) {
+        float inf, wdr;
+        char units[8];
+        uart_flush_input(SYRINGE_UART);
+        Syringe_QueryDispensed(&inf, &wdr, units, sizeof(units));
+        printf("📊 DIS: I=%.2f %s | W=%.2f %s\n",
+               inf, units, wdr, units);
+        vTaskDelay(pdMS_TO_TICKS(500));
+    }
+
+    // 11) STP
+    uart_flush_input(SYRINGE_UART);
+    Syringe_Stop();
+    printf("\n⏹️ STOP\n");
+}
+
+
 // MAIN
 
 void app_main(void)
 {
-  // --- INIT ---
-  initLaser();
-  initServo();
-  initStepper();
-  net_eg = xEventGroupCreate();
-  xTaskCreatePinnedToCore(net_task, "net", 4096, NULL, 5, NULL, 0);
-  wifi_init_sta();
-  vTaskDelay(pdMS_TO_TICKS(5000));  // pequeña pausa
-
-  
-  xTaskCreatePinnedToCore(needle_task, "needle", 6144, NULL, 5, NULL, 1);
-  xTaskCreatePinnedToCore(telemetry_task, "telemetry", 4096, NULL, 6, NULL, 0);
-  xTaskCreatePinnedToCore(pid_control_task,"pid",     6144, NULL, 5, NULL, 1);
-  // // xTaskCreatePinnedToCore(comando_task,  "cmd",       4096, NULL, 3, NULL, 1);
-  // // xTaskCreatePinnedToCore(grafcet_task,  "grafcet",   6144, NULL, 4, NULL, 1);
-
-  registrar_handler_sensor("sh", sh_handler);
-  registrar_handler_sensor("spd", spd_handler);
-  registrar_handler_sensor("mh", mh_handler);
-  registrar_handler_sensor("mpd", mpd_handler);
-
-  // PRUEBAS DE HANDLERS SIN GRAFCET
-  modo = MODO_MANUAL;
-
-  log_line("=== TEST SH_HANDLER ===");
-  vTaskDelay(pdMS_TO_TICKS(3000));  // espera 3 s
-  bool ok_sh = sh_handler(-1);
-  log_line("sh_handler() → %s", ok_sh ? "OK" : "FAIL");
-  
-
-  log_line("=== TEST SPD MANUAL ===");
-  while (!spd_handler(-1)) vTaskDelay(pdMS_TO_TICKS(200));
-
-  log_line("=== SH_HANDLER ===");
-  vTaskDelay(pdMS_TO_TICKS(3000));  // espera 3 s
-  bool ok_sh2 = sh_handler(-1);
-  log_line("sh_handler() → %s", ok_sh2 ? "OK" : "FAIL");
-
-  log_line("=== TEST SPD_HANDLER AUTO ===");
-  pruebas_laser();
-  vTaskDelay(pdMS_TO_TICKS(3000));  // espera 3 s
-  modo = MODO_AUTOMATICO;
-  bool ok_spd = false;
-  g_params.gap = 130.0f;       // <- fija aquí tu setpoint
-  while (!(ok_spd=spd_handler(-1))) {
-    vTaskDelay(pdMS_TO_TICKS(200));
-  }
-  log_line("spd_handler() → %s", ok_spd ? "OK" : "FAIL");
-  pruebas_laser();
-
-  log_line("=== TEST MPD ===");
-  vTaskDelay(pdMS_TO_TICKS(3000));  // pequeña pausa
-  modo = MODO_MANUAL;
-  bool ok_mpd = false;
-  while (!(ok_mpd = mpd_handler(-1))) {
-    vTaskDelay(pdMS_TO_TICKS(200));
-  }
-  log_line("mpd_handler() → %s", ok_mpd ? "OK" : "FAIL");
-
-  log_line("=== TEST MH ===");
-  vTaskDelay(pdMS_TO_TICKS(3000));  // pequeña pausa
-  modo = MODO_MANUAL;
-  bool ok_mh = false;
-  while (!(ok_mh = mh_handler(-1))) {
-    vTaskDelay(pdMS_TO_TICKS(200));
-  }
-  log_line("mh_handler() → %s", ok_mh ? "OK" : "FAIL");
-
+    example_syringe_sequence();
 }
+
+// void app_main(void) PRUEBAS PRUEBAS PRUEBAS
+// {
+//   // --- INIT ---
+//   initLaser();
+//   initServo();
+//   initStepper();
+//   net_eg = xEventGroupCreate();
+//   xTaskCreatePinnedToCore(net_task, "net", 4096, NULL, 5, NULL, 0);
+//   wifi_init_sta();
+//   vTaskDelay(pdMS_TO_TICKS(5000));  // pequeña pausa
+
+  
+//   xTaskCreatePinnedToCore(needle_task, "needle", 6144, NULL, 5, NULL, 1);
+//   xTaskCreatePinnedToCore(telemetry_task, "telemetry", 4096, NULL, 6, NULL, 0);
+//   xTaskCreatePinnedToCore(pid_control_task,"pid",     6144, NULL, 5, NULL, 1);
+//   // // xTaskCreatePinnedToCore(comando_task,  "cmd",       4096, NULL, 3, NULL, 1);
+//   // // xTaskCreatePinnedToCore(grafcet_task,  "grafcet",   6144, NULL, 4, NULL, 1);
+
+//   registrar_handler_sensor("sh", sh_handler);
+//   registrar_handler_sensor("spd", spd_handler);
+//   registrar_handler_sensor("mh", mh_handler);
+//   registrar_handler_sensor("mpd", mpd_handler);
+
+//   // PRUEBAS DE HANDLERS SIN GRAFCET
+//   modo = MODO_MANUAL;
+
+//   log_line("=== TEST SH_HANDLER ===");
+//   vTaskDelay(pdMS_TO_TICKS(3000));  // espera 3 s
+//   bool ok_sh = sh_handler(-1);
+//   log_line("sh_handler() → %s", ok_sh ? "OK" : "FAIL");
+  
+
+//   log_line("=== TEST SPD MANUAL ===");
+//   while (!spd_handler(-1)) vTaskDelay(pdMS_TO_TICKS(200));
+
+//   log_line("=== SH_HANDLER ===");
+//   vTaskDelay(pdMS_TO_TICKS(3000));  // espera 3 s
+//   bool ok_sh2 = sh_handler(-1);
+//   log_line("sh_handler() → %s", ok_sh2 ? "OK" : "FAIL");
+
+//   log_line("=== TEST SPD_HANDLER AUTO ===");
+//   pruebas_laser();
+//   vTaskDelay(pdMS_TO_TICKS(3000));  // espera 3 s
+//   modo = MODO_AUTOMATICO;
+//   bool ok_spd = false;
+//   g_params.gap = 130.0f;       // <- fija aquí tu setpoint
+//   while (!(ok_spd=spd_handler(-1))) {
+//     vTaskDelay(pdMS_TO_TICKS(200));
+//   }
+//   log_line("spd_handler() → %s", ok_spd ? "OK" : "FAIL");
+//   pruebas_laser();
+
+//   log_line("=== TEST MPD ===");
+//   vTaskDelay(pdMS_TO_TICKS(3000));  // pequeña pausa
+//   modo = MODO_MANUAL;
+//   bool ok_mpd = false;
+//   while (!(ok_mpd = mpd_handler(-1))) {
+//     vTaskDelay(pdMS_TO_TICKS(200));
+//   }
+//   log_line("mpd_handler() → %s", ok_mpd ? "OK" : "FAIL");
+
+//   log_line("=== TEST MH ===");
+//   vTaskDelay(pdMS_TO_TICKS(3000));  // pequeña pausa
+//   modo = MODO_MANUAL;
+//   bool ok_mh = false;
+//   while (!(ok_mh = mh_handler(-1))) {
+//     vTaskDelay(pdMS_TO_TICKS(200));
+//   }
+//   log_line("mh_handler() → %s", ok_mh ? "OK" : "FAIL");
+
+// }
 
 
 // void app_main(void)
