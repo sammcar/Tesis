@@ -34,6 +34,7 @@
 #include "ServoSG90.h"
 #include "esp_log.h"
 #include "freertos/semphr.h"
+#include "VariacRS485.h" 
 
 // DEFINICIONES
 
@@ -194,6 +195,10 @@ static int    etapa_fallo_idx = -1;
 static const char* salida_manual = NULL;
 static bool salidas_prev[NUM_SALIDAS] = { 0 };
 
+static bool g_syr_run_active   = false;  // RUN en curso (programa de volumen)
+static bool g_syr_program_done = false;  // monitor_task detectó fin de programa
+static bool g_syr_has_activity = false;  // hubo RUN o purga INF (algo movió la jeringa)
+
 const float GAP_0_DEG_MM   = 120.0f;
 const float GAP_90_DEG_MM  = 137.0f;
 const float GAP_180_DEG_MM = 150.0f;
@@ -214,6 +219,10 @@ static volatile float g_needle_target_mm = 140.0f;  // objetivo actual
 static volatile float g_needle_gap_mm    = 0.0f;    // último gap filtrado
 static volatile bool  g_needle_moving    = false;   // true mientras esté fuera de banda
 static volatile bool mover_servo_task = false;
+
+volatile bool syr_run_active   = false;
+volatile bool syr_program_done = false;
+volatile int  syr_target_vol_ul = 0; 
 
 // Snapshots publicados por needle_task (últimos valores válidos)
 static volatile float g_sensor_mm_raw  = NAN;   // lectura cruda del VL53L0X
@@ -246,6 +255,7 @@ static gap_shared_t g_gap = { NAN, NAN, NAN, 0, false };
 static SemaphoreHandle_t g_gap_mutex = NULL;
 uint16_t mm = 0;
 const TickType_t LOOP_TICK = pdMS_TO_TICKS((int)(1000.0f/LOOP_HZ));
+static TaskHandle_t s_syr_mon_task = NULL;
 
 // PROTOTIPOS
 
@@ -270,6 +280,7 @@ static inline float angle_to_gap_mm(float deg);
 static inline float laser_mm_to_gap_mm(float sensor_mm);
 static inline void set_last_gap(float mm, bool from_sensor);
 bool probe_laser(uint16_t *out_raw_mm, float *out_gap_mm);
+static void syringe_monitor_task(void *arg);
 
 // CONSTANTES GRAFCET
 
@@ -526,11 +537,74 @@ static inline float angle_to_gap_mm(float deg)
   return clampf(GAP_180_DEG_MM, NEEDLE_MIN_MM, NEEDLE_MAX_MM);
 }
 
-
 static inline float laser_mm_to_gap_mm(float sensor_mm)
 {
   float gap = CAL_M * sensor_mm + CAL_B;
   return clampf(gap, NEEDLE_MIN_MM, NEEDLE_MAX_MM);
+}
+
+static bool parse_dis_compacto(const char* src, float* out_I_ul, float* out_W_ul) {
+    if (!src || !out_I_ul || !out_W_ul) return false;
+
+    // 1) saltar "00" + estado (S/I/W) si aparecen
+    const char *p = src;
+    while (*p && (unsigned char)*p <= ' ') p++;
+    if (p[0]=='0' && p[1]=='0') p += 2;
+    if (*p=='S' || *p=='I' || *p=='W') p++;
+
+    // 2) buscar 'I' y leer número hasta 'W'
+    const char *iPos = strchr(p, 'I');
+    const char *wPos = strchr(p, 'W');
+    if (!iPos || !wPos || wPos <= iPos) return false;
+
+    // número después de I
+    iPos++; // salta 'I'
+    // permite espacios o no
+    while (*iPos == ' ') iPos++;
+    char numI[32] = {0};
+    int ni = 0;
+    while (*iPos && *iPos != 'W' && ni < (int)sizeof(numI)-1) {
+        if ((*iPos >= '0' && *iPos <= '9') || *iPos == '.' ) {
+            numI[ni++] = *iPos;
+        }
+        iPos++;
+    }
+
+    // número después de W hasta letras finales (UL/ML)
+    wPos++; // salta 'W'
+    while (*wPos == ' ') wPos++;
+    char numW[32] = {0};
+    int nw = 0;
+    const char *q = wPos;
+    while (*q) {
+        if ((*q >= '0' && *q <= '9') || *q == '.') {
+            if (nw < (int)sizeof(numW)-1) numW[nw++] = *q;
+        } else if ((*q >= 'A' && *q <= 'Z') || (*q >= 'a' && *q <= 'z')) {
+            break; // unidades empiezan aquí
+        }
+        q++;
+    }
+
+    // 3) detectar unidades (esperamos UL o ML); si ML, convertir a UL
+    char units[8] = {0};
+    int uu = 0;
+    while (*q && uu < (int)sizeof(units)-1) {
+        if ((*q >= 'A' && *q <= 'Z') || (*q >= 'a' && *q <= 'z')) {
+            units[uu++] = (*q >= 'a' && *q <= 'z') ? (*q - 32) : *q; // uppercase
+        }
+        q++;
+    }
+
+    float I = atof(numI);
+    float W = atof(numW);
+    // convertir a UL si llegara en ML
+    if (units[0]=='M' && units[1]=='L') {
+        I *= 1000.0f;
+        W *= 1000.0f;
+    }
+    *out_I_ul = I;
+    *out_W_ul = W;
+    return true;
 }
 
 bool probe_laser(uint16_t *out_raw_mm, float *out_gap_mm) {
@@ -563,6 +637,27 @@ void pruebas_laser(void){
       printf("[probe] sin lectura\n");
     }
 }
+
+void syringe_start_monitor_task(void) {
+    if (!syr_run_active) {
+        printf("⚠️ Monitor no iniciado: run no activo.\n");
+        return;
+    }
+    if (s_syr_mon_task) {
+        printf("ℹ️ Monitor ya estaba corriendo.\n");
+        return;
+    }
+    BaseType_t ok = xTaskCreatePinnedToCore(
+        syringe_monitor_task, "syr_MON", 4096, NULL, 5, &s_syr_mon_task, tskNO_AFFINITY
+    );
+    if (ok != pdPASS) {
+        s_syr_mon_task = NULL;
+        printf("❌ No se pudo crear la tarea de monitor.\n");
+    }
+}
+
+
+// INIT
 
 void initLaser(void){
 
@@ -608,6 +703,12 @@ void initStepper(void){
   stepper_enable(&g_motor, true);
 }
 
+void init232(void){
+  Syringe_Init();
+  Syringe_SetAddress(0);
+  Syringe_ExitSafeMode();
+  vTaskDelay(pdMS_TO_TICKS(100));
+}
 
 // TASKS
 
@@ -884,7 +985,51 @@ static void needle_task(void *arg)
     vTaskDelayUntil(&last, LOOP_TICK);
   }
 }
-  
+
+static void syringe_monitor_task(void *arg) {
+    const TickType_t kPeriod = pdMS_TO_TICKS(300);  // ~3–4 Hz
+    char buf[96];
+
+    printf("🩺 Monitor DIS iniciado (target=%d UL)\n", syr_target_vol_ul);
+
+    while (true) {
+        if (!syr_run_active) {
+            // Si alguien desactivó el RUN, terminamos silenciosamente
+            printf("ℹ️ Monitor: run inactivo, saliendo.\n");
+            break;
+        }
+
+        uart_flush_input(SYRINGE_UART);
+        Syringe_SendCommand("DIS");
+        int n = Syringe_ReadResponse(buf, sizeof(buf), 400);
+
+        if (n > 0) {
+            buf[n] = '\0';
+            float I_ul = 0.0f, W_ul = 0.0f;
+            if (parse_dis_compacto(buf, &I_ul, &W_ul)) {
+                // Puedes descomentar para ver el avance:
+                //printf("📊 DIS: I=%.3f UL | W=%.3f UL\n", I_ul, W_ul);
+
+                if ((int)(I_ul + 0.5f) >= syr_target_vol_ul) {
+                    syr_program_done = true;
+                    syr_run_active   = false;  // ya terminó el programa
+                    printf("✅ Objetivo alcanzado: I≈%.3f UL (target %d UL). Fin de monitor.\n",
+                           I_ul, syr_target_vol_ul);
+                    break;
+                }
+            } else {
+                // printf("⚠️ No pude parsear DIS: '%s'\n", buf);
+            }
+        }
+        vTaskDelay(kPeriod);
+    }
+
+    // Auto-termina
+    TaskHandle_t th = s_syr_mon_task;
+    s_syr_mon_task = NULL;
+    if (th) vTaskDelete(NULL);
+}
+
 // Handlers
 
 static bool mh_handler(int s_idx){
@@ -1112,54 +1257,133 @@ static bool sensor_mock_timed_hold_2s(int s_idx) {
   return sensor_mock_timed_hold_generic(s_idx, 2);
 }
 
-static bool llamar_ok232_handler(int s_idx){
-  (void)s_idx;
+static bool ok232_handler(int s_idx)
+{
+    (void)s_idx;
 
-  static bool started = false;
-  static bool bootstrapped = false;
+    static bool s_done   = false;
+    static bool s_cached = false;
 
-  if (!bootstrapped) {
-    log_line("[ok232] Bootstrap (Init/Addr/SafeOff)...");
-    Syringe_Init();
-    Syringe_SetAddress(0);
-    Syringe_ExitSafeMode();
-    vTaskDelay(pdMS_TO_TICKS(150));
-    uart_flush_input(SYRINGE_UART);
-    bootstrapped = true;
-  }
-
-  if (!started){
-    started = true;
-    log_line("[ok232] Test iniciado (SAFO + SAF0 + VER)");
-  }
-
-  char fw[64] = {0};
-  char diag[256] = {0};
-
-  // ↑ sube timeout para mayor robustez bajo carga Wi-Fi/MQTT:
-  bool ok = Syringe_TestVER(fw, sizeof(fw), diag, sizeof(diag), 4000);
-
-  // imprime tokens de diag (pero sin “flood”)
-  if (diag[0]) {
-    char *p = diag, *tok;
-    int count = 0;
-    while ((tok = strsep(&p, ";")) != NULL) {
-      if (*tok) {
-        log_line("[ok232] %s", tok);
-        if (++count > 12) break; // corta por si hay spam
-      }
+    if (!s_done) {
+        bool ok = syringe_ver();
+        printf("[ok232] syringe_ver() => %s\n", ok ? "TRUE" : "FALSE");
+        s_cached = ok;
+        s_done   = true;
     }
-  }
 
-  if (ok) {
-    log_line("✅ [ok232] Firmware: %s", fw);
-    started = false;
-    return true;
-  } else {
-    log_line("❌ [ok232] No me he podido comunicar (esperando timeout de etapa).");
-  }
-  return false;
+    return s_cached;
 }
+
+static bool soff_handler(int s_idx)
+{
+    (void)s_idx;
+
+    static bool s_purged_once = false;
+
+    // 1) Si nunca se ha movido la jeringa, consideramos "seguro" sin hacer nada
+    if (!g_syr_has_activity) {
+        // estado inicial: no hay nada que replegar
+        return true;
+    }
+
+    // 2) Ya hubo actividad → debemos purgar hacia WDR una sola vez
+    if (!s_purged_once) {
+        printf("[soff] purga WDR 5s...\n");
+        bool ok = syringe_purge_wdr_5s();
+        printf("[soff] purge_wdr_5s => %s\n", ok ? "TRUE" : "FALSE");
+
+        if (!ok) {
+            // algo falló en la purga; el GRAFCET verá false y podrá manejar fallo
+            return false;
+        }
+
+        // Purga OK → volvemos a estado "reposo"
+        s_purged_once      = true;
+        g_syr_run_active   = false;
+        g_syr_program_done = false;
+        g_syr_has_activity = false;
+    }
+
+    // 3) Ya purgada / en reposo → sensor satisfecho
+    return true;
+}
+
+static bool son_handler(int s_idx)
+{
+    (void)s_idx;
+
+    // Para no repetir acciones infinitamente
+    static bool s_done_manual  = false;
+    static bool s_done_auto    = false;
+
+    // --- 1) Modos MANUAL / CICLO / ETAPA → purga INF 5 s ---
+    if (modo == MODO_MANUAL || modo == MODO_CICLO || modo == MODO_ETAPA) {
+        if (!s_done_manual) {
+            printf("[son] Modo MAN/CICLO/ETAPA → PURGE INF 5s\n");
+            bool ok = syringe_purge_inf_5s();
+            printf("[son] purge_inf_5s => %s\n", ok ? "TRUE" : "FALSE");
+            if (!ok) return false;
+
+            // si todo salió bien, marcamos que ya hicimos la purga
+            s_done_manual = true;
+        }
+        return true;
+    }
+
+    // --- 2) Modo AUTOMÁTICO → set params + RUN + monitor ---
+    if (modo == MODO_AUTOMATICO) {
+        if (!s_done_auto) {
+            printf("[son] Modo AUTOMATICO → set params + RUN\n");
+
+            // ⚠️ Ajusta estos constantes a lo que necesites o cámbialos luego
+            int DIA_MM      = 10;   // mm
+            int RATE_UL_MIN = 14;   // UL/min
+            int VOL_UL      = 12;   // UL
+
+            syringe_set_params_demo_int(DIA_MM, RATE_UL_MIN, VOL_UL);
+            syringe_start_run_and_estimate();
+            syringe_start_monitor_task();
+
+            s_done_auto = true;
+        }
+        // El sensor "son" solo indica que la secuencia de arranque ya se lanzó.
+        // El final real del programa lo vigilará "okmon".
+        return true;
+    }
+
+    // --- 3) Otros modos (por si acaso) → no hacer nada especial ---
+    return true;
+}
+
+// static bool okmon_handler(int s_idx)
+// {
+//     (void)s_idx;
+
+//     // Si nunca se configuró un volumen objetivo, no hay nada que monitorear.
+//     // En ese caso, consideramos el sensor "OK" para no bloquear el GRAFCET.
+//     if (g_syr_target_vol_ul <= 0.0f) {
+//         // log_line("[okmon] sin volumen objetivo configurado → nada que monitorear");
+//         return true;
+//     }
+
+//     // Si la tarea de monitoreo marcó que el programa terminó
+//     if (g_syr_program_done) {
+//         g_syr_program_done = false;  // consumimos el evento (one-shot)
+
+//         log_line("✅ [okmon] programa de jeringa completado: I=%.3f UL (target=%.3f UL)",
+//                  g_syr_last_dis_inf_ul, g_syr_target_vol_ul);
+
+//         return true;   // habilita la transición del GRAFCET
+//     }
+
+//     // Si aún no terminó, seguimos esperando
+//     // (la tarea syringe_monitor_task se encarga de ir actualizando g_syr_last_dis_inf_ul)
+//     // Podrías loguear de vez en cuando, pero mejor no spamear en cada ciclo:
+//     // log_line("[okmon] en progreso: I=%.3f / %.3f UL", g_syr_last_dis_inf_ul, g_syr_target_vol_ul);
+
+//     return false;
+// }
+
 
 // NVS
 
@@ -2142,6 +2366,7 @@ static void i2c_force_release(gpio_num_t sda, gpio_num_t scl) {
   vTaskDelay(pdMS_TO_TICKS(2));
 }
 
+// Syringe
 
 void pruebaSyringe(void) {
     printf("⚡ Iniciando prueba de SyringeRS232...\n");
@@ -2287,25 +2512,479 @@ void example_syringe_sequence(void) {
     printf("\n⏹️ STOP\n");
 }
 
+static bool syringe_ver(void) {
+    char buf[96] = {0};
+    int  len     = 0;
+
+    // 1) Primer intento de VER
+    uart_flush_input(SYRINGE_UART);
+    Syringe_SendCommand("VER");
+    len = Syringe_ReadResponse(buf, sizeof(buf), 1000);
+    if (len <= 0) {
+        printf("❌ VER: sin respuesta (intento 1)\n");
+    } else {
+        printf("📥 VER raw (1): %s\n", buf);
+    }
+
+    // 2) Si hay alarma de reset A?R, límpiala con PF 0 y reintenta VER
+    if (len > 0 && strstr(buf, "A?R")) {
+        printf("⚠️ VER: alarma A?R detectada → PF 0\n");
+        uart_flush_input(SYRINGE_UART);
+        Syringe_SendCommand("PF 0");
+        vTaskDelay(pdMS_TO_TICKS(120));
+        char dump[64] = {0};
+        Syringe_ReadResponse(dump, sizeof(dump), 300); // descarta/diagnóstico
+        uart_flush_input(SYRINGE_UART);
+
+        // reintento VER
+        Syringe_SendCommand("VER");
+        len = Syringe_ReadResponse(buf, sizeof(buf), 1000);
+        if (len <= 0) {
+            printf("❌ VER: sin respuesta tras PF 0 (intento 2)\n");
+        } else {
+            printf("📥 VER raw (2): %s\n", buf);
+        }
+    }
+
+    if (len <= 0) {
+        return false;
+    }
+
+    // 3) Normaliza prefijo "00S..." y recorta espacios/CRLF sin depender de la lib
+    //    (lo hacemos localmente para no tocar tu librería)
+    // trim inicio
+    char *p = buf;
+    while (*p && (unsigned char)*p <= ' ') p++;
+
+    // quita "00" si viene
+    if (p[0] == '0' && p[1] == '0') p += 2;
+    // quita marcador de estado ('S','I','W') si viene
+    if (*p == 'S' || *p == 'I' || *p == 'W') p++;
+
+    // trim final
+    size_t n = strlen(p);
+    while (n > 0 && (p[n-1] == '\r' || p[n-1] == '\n' || p[n-1] == ' ' || p[n-1] == '\t')) p[--n] = '\0';
+
+    if (*p == '\0') {
+        printf("⚠️ VER: respuesta vacía tras normalizar\n");
+        return false;
+    }
+
+    printf("✅ Firmware: %s\n", p);
+    return true;
+}
+
+static void syringe_set_params_demo_int(int dia_mm, int rate_ul_min, int vol_ul)
+{
+    char buf[128] = {0};
+    int n = 0;
+
+    syr_target_vol_ul = vol_ul;
+
+    // Selección de fase y función
+    uart_flush_input(SYRINGE_UART);
+    Syringe_SendCommand("PHN 1");
+    n = Syringe_ReadResponse(buf, sizeof(buf), 600);
+    printf("PHN set RESP: %.*s\n", n>0?n:0, buf);
+
+    uart_flush_input(SYRINGE_UART);
+    Syringe_SendCommand("FUN RAT");
+    n = Syringe_ReadResponse(buf, sizeof(buf), 600);
+    printf("FUN set RESP: %.*s\n", n>0?n:0, buf);
+
+    // DIA (formateo seguro: entero con .0 para cumplir float si el firmware lo exige)
+    uart_flush_input(SYRINGE_UART);
+    {
+        char cmd[32];
+        // En muchos firmwares "DIA 9" funciona, pero usar ".0" es universalmente aceptado:
+        snprintf(cmd, sizeof(cmd), "DIA %d.0", dia_mm);
+        Syringe_SendCommand(cmd);
+    }
+    n = Syringe_ReadResponse(buf, sizeof(buf), 600);
+    printf("DIA set RESP: %.*s\n", n>0?n:0, buf);
+
+    // Confirmar DIA
+    memset(buf, 0, sizeof(buf));
+    uart_flush_input(SYRINGE_UART);
+    Syringe_SendCommand("DIA");
+    n = Syringe_ReadResponse(buf, sizeof(buf), 600);
+    if (n>0) {
+        char *p = buf;
+        if (p[0]=='0'&&p[1]=='0') p+=2;
+        if (*p=='S'||*p=='I'||*p=='W') p++;
+        printf("DIA actual: %s\n", p);
+    }
+
+    // Dirección INF (por claridad)
+    uart_flush_input(SYRINGE_UART);
+    Syringe_SendCommand("DIR INF");
+    n = Syringe_ReadResponse(buf, sizeof(buf), 600);
+    printf("DIR set RESP: %.*s\n", n>0?n:0, buf);
+
+    // RATE en UL/min (tu equipo acepta "RAT <val> UM")
+    uart_flush_input(SYRINGE_UART);
+    {
+        char cmd[32];
+        snprintf(cmd, sizeof(cmd), "RAT %d UM", rate_ul_min);
+        Syringe_SendCommand(cmd);
+    }
+    n = Syringe_ReadResponse(buf, sizeof(buf), 600);
+    printf("RAT set RESP: %.*s\n", n>0?n:0, buf);
+
+    // Confirmar RATE
+    memset(buf, 0, sizeof(buf));
+    uart_flush_input(SYRINGE_UART);
+    Syringe_SendCommand("RAT");
+    n = Syringe_ReadResponse(buf, sizeof(buf), 600);
+    if (n>0) {
+        char *p = buf;
+        if (p[0]=='0'&&p[1]=='0') p+=2;
+        if (*p=='S'||*p=='I'||*p=='W') p++;
+        printf("RAT actual: %s\n", p); // ej: "14.00 UM"
+    }
+
+    // VOL como entero (sin unidades, sin decimales)
+    uart_flush_input(SYRINGE_UART);
+    {
+        char cmd[32];
+        snprintf(cmd, sizeof(cmd), "VOL %d", vol_ul);
+        Syringe_SendCommand(cmd);
+    }
+    n = Syringe_ReadResponse(buf, sizeof(buf), 600);
+    printf("VOL set RESP: %.*s\n", n>0?n:0, buf);
+
+    // Confirmar VOL
+    memset(buf, 0, sizeof(buf));
+    uart_flush_input(SYRINGE_UART);
+    Syringe_SendCommand("VOL");
+    n = Syringe_ReadResponse(buf, sizeof(buf), 600);
+    if (n>0) {
+        char *p = buf;
+        if (p[0]=='0'&&p[1]=='0') p+=2;
+        if (*p=='S'||*p=='I'||*p=='W') p++;
+        printf("VOL actual: %s\n", p); // ej: "13.00UL"
+    }
+
+    printf("✅ Parámetros aplicados (PHN=1, FUN=RAT, DIA=%d, RATE=%d UM, VOL=%d UL)\n",
+           dia_mm, rate_ul_min, vol_ul);
+}
+
+static void syringe_run_brief_demo(void) {
+    char buf[96] = {0};
+
+    // 2) Dirección de bombeo → INF
+    uart_flush_input(SYRINGE_UART);
+    Syringe_SetDirection("INF");
+    vTaskDelay(pdMS_TO_TICKS(120));
+
+    // 3) Limpia contadores dispensados (opcional pero útil para lectura)
+    uart_flush_input(SYRINGE_UART);
+    Syringe_ClearDispensed("INF");
+    Syringe_ClearDispensed("WDR");
+    vTaskDelay(pdMS_TO_TICKS(120));
+
+    // 4) Arranca RUN (desde la fase actual)
+    uart_flush_input(SYRINGE_UART);
+    Syringe_Run(1);
+    printf("▶️ RUN iniciado (fase 1)\n");
+
+    // 5) Monitor corto de DIS (volumen infundido/retirado) y luego STOP
+    for (int i = 0; i < 5; ++i) {
+        float inf = 0.0f, wdr = 0.0f;
+        char units[8] = {0};
+        uart_flush_input(SYRINGE_UART);
+        if (Syringe_QueryDispensed(&inf, &wdr, units, sizeof(units))) {
+            printf("📊 DIS: I=%.2f %s | W=%.2f %s\n", inf, units, wdr, units);
+        } else {
+            printf("⚠️ DIS: sin respuesta\n");
+        }
+        vTaskDelay(pdMS_TO_TICKS(400));
+    }
+
+    // 6) STOP
+    uart_flush_input(SYRINGE_UART);
+    Syringe_Stop();
+    printf("⏹️ STOP\n");
+}
+
+static void syringe_start_run_and_estimate(void)
+{
+    // 1) Asegurar dirección INF
+    uart_flush_input(SYRINGE_UART);
+    Syringe_SendCommand("DIR INF");
+    int n; char buf[96] = {0};
+    n = Syringe_ReadResponse(buf, sizeof(buf), 400);
+    printf("DIR set RESP: %.*s\n", n>0?n:0, buf);
+
+    // 2) Consultar tasa actual para estimar (RAT)
+    float rate_ul_min = 0.0f;
+    char units[8] = {0};
+
+    uart_flush_input(SYRINGE_UART);
+    Syringe_SendCommand("RAT");
+    n = Syringe_ReadResponse(buf, sizeof(buf), 600);
+    if (n > 0) {
+        // normaliza: quitar "00" + estado (S/I/W) y trims
+        char *p = buf;
+        while (*p && (unsigned char)*p <= ' ') p++;
+        if (p[0]=='0' && p[1]=='0') p+=2;
+        if (*p=='S' || *p=='I' || *p=='W') p++;
+        size_t m = strlen(p);
+        while (m>0 && (p[m-1]=='\r'||p[m-1]=='\n'||p[m-1]==' '||p[m-1]=='\t')) p[--m]='\0';
+
+        if (sscanf(p, "%f %7s", &rate_ul_min, units) != 2) {
+            printf("⚠️ RAT parse falló: '%s'\n", p);
+        }
+    } else {
+        printf("⚠️ RAT sin respuesta\n");
+    }
+
+    // 3) Enviar RUN
+    uart_flush_input(SYRINGE_UART);
+    Syringe_SendCommand("RUN");
+    n = Syringe_ReadResponse(buf, sizeof(buf), 600);
+    printf("RUN RESP: %.*s\n", n>0?n:0, buf);
+
+    // 4) Estimar duración y marcar flags
+    if (rate_ul_min > 0.0f && syr_target_vol_ul > 0) {
+        float minutes = ((float)syr_target_vol_ul) / rate_ul_min;
+        float seconds = minutes * 60.0f;
+        printf("⏱️ Estimado: %.2f s (≈ %.2f min) para VOL=%d UL @ RATE=%.2f %s\n",
+               seconds, minutes, syr_target_vol_ul, rate_ul_min, units[0] ? units : "UM");
+    } else {
+        printf("⚠️ Estimación no disponible (RATE=%.2f, VOL=%d)\n",
+               rate_ul_min, syr_target_vol_ul);
+    }
+
+    syr_program_done = false;
+    syr_run_active   = true;
+    g_syr_run_active   = true;
+    g_syr_program_done = false;
+    g_syr_has_activity = true;
+}
+
+static bool syringe_purge_wdr_5s(void) {
+    char resp[64] = {0};
+    int  n = 0;
+
+    // 1) Asegura dirección WDR
+    uart_flush_input(SYRINGE_UART);
+    Syringe_SendCommand("DIR WDR");
+    n = Syringe_ReadResponse(resp, sizeof(resp), 400);
+    if (n <= 0) {
+        printf("❌ DIR WDR: sin respuesta\n");
+        return false;
+    }
+    printf("DIR set RESP: %.*s\n", n, resp);
+
+    // 2) PUR (máxima velocidad en dirección actual)
+    uart_flush_input(SYRINGE_UART);
+    Syringe_SendCommand("PUR");
+    n = Syringe_ReadResponse(resp, sizeof(resp), 400);
+    if (n <= 0) {
+        printf("❌ PUR: sin respuesta\n");
+        return false;
+    }
+    printf("PUR RESP: %.*s\n", n, resp);  // típicamente “00I” (bombeando)
+
+    // 3) Mantener 5 s purgando
+    vTaskDelay(pdMS_TO_TICKS(5000));
+
+    // 4) STP para detener la purga
+    uart_flush_input(SYRINGE_UART);
+    Syringe_SendCommand("STP");
+    n = Syringe_ReadResponse(resp, sizeof(resp), 600);
+    if (n <= 0) {
+        printf("❌ STP: sin respuesta\n");
+        return false;
+    }
+    printf("STP RESP: %.*s\n", n, resp);  // típicamente “00S”
+
+    printf("✅ Purga WDR 5 s finalizada.\n");
+    return true;
+}
+
+static bool syringe_purge_inf_5s(void) {
+    char resp[64] = {0};
+    int  n = 0;
+
+    // 1) Asegura dirección INF
+    uart_flush_input(SYRINGE_UART);
+    Syringe_SendCommand("DIR INF");
+    n = Syringe_ReadResponse(resp, sizeof(resp), 400);
+    if (n <= 0) {
+        printf("❌ DIR INF: sin respuesta\n");
+        return false;
+    }
+    printf("DIR set RESP: %.*s\n", n, resp);
+
+    // 2) PUR (máxima velocidad en la dirección actual)
+    uart_flush_input(SYRINGE_UART);
+    Syringe_SendCommand("PUR");
+    n = Syringe_ReadResponse(resp, sizeof(resp), 400);
+    if (n <= 0) {
+        printf("❌ PUR: sin respuesta\n");
+        return false;
+    }
+    printf("PUR RESP: %.*s\n", n, resp);  // común: “00I”
+
+    // 3) Mantener 5 s purgando
+    vTaskDelay(pdMS_TO_TICKS(5000));
+
+    // 4) STP para detener la purga
+    uart_flush_input(SYRINGE_UART);
+    Syringe_SendCommand("STP");
+    n = Syringe_ReadResponse(resp, sizeof(resp), 600);
+    if (n <= 0) {
+        printf("❌ STP: sin respuesta\n");
+        return false;
+    }
+    printf("STP RESP: %.*s\n", n, resp);  // común: “00S”
+
+    printf("✅ Purga INF 5 s finalizada.\n");
+    g_syr_has_activity = true;
+    return true;
+}
+
+static void syringe_stop(void) {
+    char resp[64] = {0};
+    int n;
+
+    uart_flush_input(SYRINGE_UART);
+    Syringe_SendCommand("STP");
+    n = Syringe_ReadResponse(resp, sizeof(resp), 600);
+    if (n <= 0) {
+        printf("❌ STP: sin respuesta\n");
+        return;
+    }
+    // Respuestas típicas:
+    // - “00I” si seguía en movimiento (raro tras STP, pero posible en eco inmediato)
+    // - “00S” programa detenido/pausado
+    printf("STP RESP: %.*s\n", n, resp);
+}
+
+static void syringe_run(void) {
+    char resp[64] = {0};
+    int n;
+
+    uart_flush_input(SYRINGE_UART);
+    Syringe_SendCommand("RUN");
+    n = Syringe_ReadResponse(resp, sizeof(resp), 600);
+    if (n <= 0) {
+        printf("❌ RUN: sin respuesta\n");
+        return;
+    }
+    // Respuestas típicas:
+    // - “00I” cuando queda en estado Infusing
+    // - “00W” cuando queda en estado Withdrawing
+    // - “00S” si por alguna razón permanece detenido
+    printf("RUN RESP: %.*s\n", n, resp);
+}
+
+// Variac
+
+static bool Variac_CheckConnectionOnce(void) {
+    static bool already_ran = false;  // evita reinicializar si alguien la llama de nuevo
+    if (already_ran) {
+        printf("ℹ️ Variac_CheckConnectionOnce() ya fue ejecutada.\n");
+        return true; // o false, como prefieras; aquí asumimos que ya pasó
+    }
+    already_ran = true;
+
+    // 1) Inicializa UART + DE/RE (usa TX=33, RX=32, DE/RE=4 en tu .h/.c)
+    Variac_Init();
+    vTaskDelay(pdMS_TO_TICKS(200)); // pequeño respiro tras init
+
+    // 2) Intenta leer 1 holding register desde 0x0000 (func 03)
+    //    (Tu Variac_VerificarConexion ya hace eso y muestra el frame)
+    const int kTries   = 3;
+    const int kBackoff = 500; // ms
+
+    for (int i = 1; i <= kTries; ++i) {
+        printf("\n[RS485] Chequeo %d/%d: Variac_VerificarConexion()\n", i, kTries);
+        if (Variac_VerificarConexion()) {
+            printf("✅ RS485/Modbus OK: el CFW300 respondió.\n");
+            return true;
+        }
+        printf("⚠️ Sin respuesta. Reintentando en %d ms...\n", kBackoff);
+        vTaskDelay(pdMS_TO_TICKS(kBackoff));
+    }
+
+    printf("❌ No se detectó respuesta del CFW300 (revisa A/B, paridad/baud/dirección, terminación/bias y GND común).\n");
+    return false;
+}
+
 
 // MAIN
 
-void app_main(void)
-{
-    example_syringe_sequence();
+void app_main(void) { // Prueba todo 
+
+    init232();
+
+    bool ok = syringe_ver();
+    printf("[RESULT] syringe_simple_ver() => %s\n", ok ? "TRUE" : "FALSE");
+    if (!ok) return;
+
+    int DIA_MM      = 10;   // mm
+    int RATE_UL_MIN = 14;  // UL/min
+    int VOL_UL      = 12;  // UL
+
+    syringe_set_params_demo_int(DIA_MM, RATE_UL_MIN, VOL_UL);
+
+    bool pur_ok = syringe_purge_wdr_5s();
+    printf("[RESULT] purge_wdr_5s => %s\n", pur_ok ? "TRUE" : "FALSE");
+
+    bool pur_ok2 = syringe_purge_inf_5s();
+    printf("[RESULT] purge_inf_5s => %s\n", pur_ok2 ? "TRUE" : "FALSE");
+
+    syringe_start_run_and_estimate();
+    syringe_start_monitor_task();
+
+    syringe_stop();
+    syringe_run();
+
+    //registrar_handler_sensor("son",   son_handler);
+    //registrar_handler_sensor("ok232", ok232_handler);
+    //registrar_handler_sensor("soff",  soff_handler);
+
 }
 
-// void app_main(void) PRUEBAS PRUEBAS PRUEBAS
+// void app_main(void) { // RS232 1.
+//     // Init mínimo que ya confirmaste:
+//     Syringe_Init();
+//     Syringe_SetAddress(0);
+//     Syringe_ExitSafeMode();
+//     vTaskDelay(pdMS_TO_TICKS(100));
+
+//     // Fijar fase/función para que VOL aplique al programa activo
+//     uart_flush_input(SYRINGE_UART);
+//     Syringe_SendCommand("PHN 1");
+//     vTaskDelay(pdMS_TO_TICKS(100));
+//     uart_flush_input(SYRINGE_UART);
+//     Syringe_SendCommand("FUN RAT");
+//     vTaskDelay(pdMS_TO_TICKS(100));
+
+//     // Probar VER ya existente
+//     bool ok = syringe_ver();
+//     printf("[RESULT] syringe_simple_ver() => %s\n", ok ? "TRUE" : "FALSE");
+
+//     // Set/confirm de DIA, RAT, VOL
+//     syringe_set_params_demo();
+// }
+
+
+// void app_main(void) // PRUEBAS PRUEBAS PRUEBAS
 // {
 //   // --- INIT ---
 //   initLaser();
 //   initServo();
 //   initStepper();
+//   init232();
+
 //   net_eg = xEventGroupCreate();
 //   xTaskCreatePinnedToCore(net_task, "net", 4096, NULL, 5, NULL, 0);
 //   wifi_init_sta();
 //   vTaskDelay(pdMS_TO_TICKS(5000));  // pequeña pausa
-
   
 //   xTaskCreatePinnedToCore(needle_task, "needle", 6144, NULL, 5, NULL, 1);
 //   xTaskCreatePinnedToCore(telemetry_task, "telemetry", 4096, NULL, 6, NULL, 0);
@@ -2320,6 +2999,21 @@ void app_main(void)
 
 //   // PRUEBAS DE HANDLERS SIN GRAFCET
 //   modo = MODO_MANUAL;
+
+//   // Fijar fase/función para que VOL aplique al programa activo
+//     uart_flush_input(SYRINGE_UART);
+//     Syringe_SendCommand("PHN 1");
+//     vTaskDelay(pdMS_TO_TICKS(100));
+//     uart_flush_input(SYRINGE_UART);
+//     Syringe_SendCommand("FUN RAT");
+//     vTaskDelay(pdMS_TO_TICKS(100));
+
+//     // Probar VER ya existente
+//     bool ok = syringe_ver();
+//     printf("[RESULT] syringe_simple_ver() => %s\n", ok ? "TRUE" : "FALSE");
+
+//     // Set/confirm de DIA, RAT, VOL
+//     syringe_set_params_demo();
 
 //   log_line("=== TEST SH_HANDLER ===");
 //   vTaskDelay(pdMS_TO_TICKS(3000));  // espera 3 s

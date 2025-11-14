@@ -5,9 +5,9 @@
 #include <stdio.h>
 
 #define VARIAC_UART      UART_NUM_1
-#define VARIAC_TXD       4
-#define VARIAC_RXD       5
-#define VARIAC_DE_RE     33  // Control del transceiver RS485
+#define VARIAC_TXD       33      // <- TX por GPIO33
+#define VARIAC_RXD       32      // <- RX por GPIO32
+#define VARIAC_DE_RE     4       // <- DE/RE por GPIO4
 #define VARIAC_BUF_SIZE  128
 
 void Variac_Init(void) {
